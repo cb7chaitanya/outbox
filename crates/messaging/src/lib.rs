@@ -64,6 +64,23 @@ impl RskafkaProducer {
     }
 }
 
+/// A [`Producer`] that always succeeds without touching a broker, for tests
+/// that don't care about the messaging side effect.
+#[derive(Debug, Default)]
+pub struct NoopProducer;
+
+#[async_trait::async_trait]
+impl Producer for NoopProducer {
+    async fn publish(
+        &self,
+        _topic: &str,
+        _key: &str,
+        _payload: Vec<u8>,
+    ) -> Result<(), MessagingError> {
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl Producer for RskafkaProducer {
     async fn publish(
