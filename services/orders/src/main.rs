@@ -1,6 +1,7 @@
 mod config;
 mod domain;
 mod http;
+mod repository;
 
 use config::Config;
 
