@@ -1,0 +1,12 @@
+[package]
+name = "messaging"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rskafka.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true

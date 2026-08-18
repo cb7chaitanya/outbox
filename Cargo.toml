@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/contracts",
+  "crates/messaging",
+  "crates/persistence",
+  "crates/telemetry",
+  "crates/test-support",
+  "crates/domain-common",
+  "services/orders",
+  "services/inventory",
+  "services/payments",
+  "services/fulfilment",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# async runtime / http
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+axum = { version = "0.8" }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "macros"] }
+
+# kafka-compatible messaging (Redpanda) — pure-Rust client, no cmake/libsasl2 build
+# dependency required for rdkafka's cmake-build feature; verified with a scratch
+# build in this environment. See docs/adr/0001-tech-stack-choices.md.
+rskafka = { version = "0.6" }
+async-trait = { version = "0.1" }
+
+# ids / time / money
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# errors
+thiserror = { version = "2" }
+anyhow = { version = "1" }
+
+# config
+figment = { version = "0.10", features = ["env"] }
+
+# observability
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# testing
+proptest = { version = "1" }
+
+# workspace-local crates
+domain-common = { path = "crates/domain-common" }
+contracts = { path = "crates/contracts" }
+messaging = { path = "crates/messaging" }
+persistence = { path = "crates/persistence" }
+telemetry = { path = "crates/telemetry" }
+test-support = { path = "crates/test-support" }
+
+[profile.dev]
+debug = 1
