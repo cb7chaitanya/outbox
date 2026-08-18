@@ -125,7 +125,7 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
 
     let len = raw.chars().count();
     let printable = raw.chars().all(|c| c.is_ascii_graphic() || c == ' ');
-    if len < MIN_IDEMPOTENCY_KEY_LEN || len > MAX_IDEMPOTENCY_KEY_LEN || !printable {
+    if !(MIN_IDEMPOTENCY_KEY_LEN..=MAX_IDEMPOTENCY_KEY_LEN).contains(&len) || !printable {
         return Err(ApiError::InvalidIdempotencyKey(format!(
             "Idempotency-Key must be {MIN_IDEMPOTENCY_KEY_LEN}-{MAX_IDEMPOTENCY_KEY_LEN} printable characters"
         )));

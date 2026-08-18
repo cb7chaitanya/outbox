@@ -76,6 +76,7 @@ pub enum TransitionError {
     Sqlx(#[from] sqlx::Error),
 }
 
+#[derive(Debug)]
 pub struct CreateOutcome {
     pub order: OrderRow,
     pub items: Vec<OrderItemRow>,
