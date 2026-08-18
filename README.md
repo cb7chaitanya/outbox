@@ -8,15 +8,16 @@ optional saga orchestrator — until the same failures are handled
 correctly. See `PROJECT_2_SPEC.md` for the full contract this repository
 implements, milestone by milestone.
 
-## What's built so far (M00-M01)
+## What's built so far (M00-M02)
 
-Workspace scaffolding (M00) plus the orders service's local-consistency
-core (M01): idempotent order creation with a race-safe concurrent-request
-guarantee, a versioned state machine enforcing the legal transition graph,
-and `GET` endpoints for an order and its transition history. Inventory,
-payments, and fulfilment remain health-endpoint skeletons. No Kafka
-publish yet — that starts at M02 (dual-write failure lab) and M03
-(transactional outbox). Track progress in
+Workspace scaffolding (M00), the orders service's local-consistency core
+(M01: idempotent order creation, versioned state machine, transition
+history), and the naive dual-write stage plus its failure lab (M02):
+`orders` now publishes `orders.order_created` directly to Kafka right
+after its DB commit — deliberately with no coordination between the two —
+and ships deterministic fault injection that reproduces both resulting
+atomicity gaps on demand. Inventory, payments, and fulfilment remain
+health-endpoint skeletons; no outbox exists yet (M03). Track progress in
 [`docs/progress.md`](docs/progress.md).
 
 ## Architecture
@@ -133,9 +134,30 @@ credentials in `.env`.
 ## Idempotency, correlation IDs, dual-write lab, outbox recovery
 
 Idempotency and correlation-ID handling are implemented for order
-creation (M01, see the curl example above and
-`docs/evidence/m01.md`). The dual-write failure lab (M02) and
-transactional-outbox recovery demo (M03) are not implemented yet. This
+creation (M01, see the curl example above and `docs/evidence/m01.md`).
+
+**Naive dual-write lab (M02):** with `DELIVERY_MODE=naive` (the current
+default — `outbox` parses but has no implementation until M03), every
+accepted `POST /v1/orders` call commits the order in Postgres and then
+publishes `orders.order_created` directly to Kafka, with nothing tying
+the two together. Run
+
+```sh
+make demo-naive-failure
+```
+
+to see both resulting atomicity gaps reproduced live against your local
+stack: (1) the DB commits but the event is never published, and (2) both
+the DB commit and the publish succeed, but a naive client retry (after
+seeing a failure it can't distinguish from gap 1) causes a real duplicate
+event on the broker. The script builds and runs `orders` itself with
+failure injection enabled, prints each violation, and tears the process
+down on exit — no manual setup beyond `make up` first. Full explanation
+of why retries cannot close either gap: [`docs/failure-lab.md`](docs/failure-lab.md).
+Deterministic, automated versions of the same two demonstrations:
+`services/orders/tests/dual_write_tests.rs`.
+
+Transactional-outbox recovery demo (M03) is not implemented yet — this
 section grows as each milestone completes; see `docs/progress.md` for
 current status and `PROJECT_2_SPEC.md` sections 11–14 for what's coming.
 
@@ -153,7 +175,7 @@ make test-unit          # cargo test --workspace --lib --bins
 make test-integration    # real Postgres integration tests (orders repository + HTTP layer)
 make test-e2e             # not yet implemented (M06/M07)
 make test                  # fmt + lint + test-unit + test-integration
-make demo-naive-failure     # not yet implemented (M02)
+make demo-naive-failure     # runs both dual-write failure demonstrations live (M02)
 make chaos-smoke              # not yet implemented (M09)
 make logs ORDER_ID=<uuid>      # tails docker compose logs filtered to one order
 ```
@@ -187,16 +209,28 @@ make reset CONFIRM=yes
 
 All configuration is environment-variable based; see `.env.example` for
 the full list (Postgres/Redpanda connection info, per-service ports,
-`FAILURE_INJECTION_ENABLED`, `DELIVERY_MODE`). Copy it to `.env` (done
-automatically by `make setup`) and adjust as needed. Never commit `.env`.
+`ENVIRONMENT`, `FAILURE_INJECTION_ENABLED`/`FAILURE_INJECTION_TOKEN`,
+`DELIVERY_MODE`). Copy it to `.env` (done automatically by `make setup`)
+and adjust as needed. Never commit `.env`.
+
+Failure injection (spec section 17) is off by default and refuses to
+start if `FAILURE_INJECTION_ENABLED=true` while `ENVIRONMENT=production`.
+When enabled, `orders` mounts `PUT /_test/faults/{name}` and
+`DELETE /_test/faults`, both requiring a matching `X-Test-Token` header
+(`FAILURE_INJECTION_TOKEN`). See `docs/adr/0004-fault-injector-placement-and-control.md`.
 
 ## Known limitations
 
-- M00-M01 only: orders has local domain logic and persistence, but no
-  outbox/inbox tables and no Kafka producers/consumers yet — `orders`
-  never publishes anything, and inventory/payments/fulfilment remain
-  health-endpoint skeletons with no persistence wiring, so their
-  `/health/ready` doesn't check a dependency yet (orders' does).
+- M00-M02 only: `orders` publishes directly to Kafka after its own DB
+  commit (naive dual write, no outbox/inbox tables yet — those land in
+  M03/M04) and nothing else consumes those events yet.
+  Inventory/payments/fulfilment remain health-endpoint skeletons with no
+  persistence wiring, so their `/health/ready` doesn't check a dependency
+  yet (orders' does).
+- The naive publish path republishes on every accepted create call,
+  including idempotent replays — a deliberate, documented anti-pattern
+  (`docs/adr/0003-naive-publish-on-every-replay.md`), not a bug to fix
+  before M03.
 - `POST /v1/orders/{id}/cancel` does not exist yet — it is optional per
   spec section 10 and deferred until the choreographed workflow (M06+)
   gives it something meaningful to cancel.
