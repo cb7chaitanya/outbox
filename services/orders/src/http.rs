@@ -51,6 +51,7 @@ struct OrderRepresentation {
     amount_minor: i64,
     version: i64,
     cancellation_reason: Option<String>,
+    correlation_id: Uuid,
     items: Vec<ItemRepresentation>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -77,6 +78,7 @@ impl OrderRepresentation {
             amount_minor: order.amount_minor,
             version: order.version,
             cancellation_reason: order.cancellation_reason,
+            correlation_id: order.correlation_id,
             items: items
                 .into_iter()
                 .map(|item| ItemRepresentation {
@@ -133,23 +135,52 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(raw.to_string())
 }
 
+/// Uses the caller-supplied `X-Correlation-ID` if it parses as a UUID,
+/// otherwise generates one (spec section 10: "optional UUID; generate one
+/// if absent"; an unparseable value is treated the same as absent rather
+/// than rejected, since correlation IDs are a tracing aid, not a
+/// correctness input).
+fn extract_or_generate_correlation_id(headers: &HeaderMap) -> Uuid {
+    headers
+        .get("x-correlation-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .unwrap_or_else(Uuid::now_v7)
+}
+
 async fn create_order(
     State(pool): State<PgPool>,
     headers: HeaderMap,
     Json(body): Json<CreateOrderRequest>,
 ) -> Result<Response, ApiError> {
     let idempotency_key = extract_idempotency_key(&headers)?;
+    let correlation_id = extract_or_generate_correlation_id(&headers);
     let normalized = validate_and_normalize(body)?;
 
-    let outcome =
-        repository::create_order(&pool, &idempotency_key, &normalized, Utc::now()).await?;
+    let outcome = repository::create_order(
+        &pool,
+        &idempotency_key,
+        &normalized,
+        correlation_id,
+        Utc::now(),
+    )
+    .await?;
 
     let representation = OrderRepresentation::from_row(outcome.order, outcome.items);
     let location = representation.links.self_.clone();
+    let response_correlation_id = representation.correlation_id;
     let mut response = (StatusCode::ACCEPTED, Json(representation)).into_response();
-    response.headers_mut().insert(
+    let headers_mut = response.headers_mut();
+    headers_mut.insert(
         header::LOCATION,
         location.parse().expect("order id is a valid header value"),
+    );
+    headers_mut.insert(
+        "x-correlation-id",
+        response_correlation_id
+            .to_string()
+            .parse()
+            .expect("uuid string is a valid header value"),
     );
     Ok(response)
 }
