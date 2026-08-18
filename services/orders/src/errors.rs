@@ -30,6 +30,12 @@ pub enum ApiError {
     IdempotencyKeyReused,
     #[error("order not found")]
     OrderNotFound,
+    #[error("injected fault fired: {0}")]
+    InjectedFault(String),
+    #[error("failed to publish event: {0}")]
+    PublishFailed(String),
+    #[error("missing or invalid X-Test-Token")]
+    FaultControlForbidden,
     #[error(transparent)]
     Internal(#[from] sqlx::Error),
 }
@@ -64,6 +70,21 @@ impl ApiError {
             ApiError::OrderNotFound => {
                 (StatusCode::NOT_FOUND, "ORDER_NOT_FOUND", "Order Not Found")
             }
+            ApiError::InjectedFault(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "INJECTED_FAULT",
+                "Injected Fault",
+            ),
+            ApiError::PublishFailed(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "EVENT_PUBLISH_FAILED",
+                "Event Publish Failed",
+            ),
+            ApiError::FaultControlForbidden => (
+                StatusCode::FORBIDDEN,
+                "FAULT_CONTROL_FORBIDDEN",
+                "Fault Control Forbidden",
+            ),
             ApiError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
