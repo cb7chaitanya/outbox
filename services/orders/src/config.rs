@@ -33,3 +33,35 @@ impl Config {
         format!("{}:{}", self.bind_addr, self.port)
     }
 }
+
+/// The shared `POSTGRES_*` variables from `.env.example` describe one
+/// server with one database per service (spec section 6); this service
+/// only ever opens its own `orders` database.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseConfig {
+    pub postgres_user: String,
+    pub postgres_password: String,
+    pub postgres_host: String,
+    pub postgres_port: u16,
+    pub postgres_orders_db: String,
+}
+
+impl DatabaseConfig {
+    pub fn load() -> anyhow::Result<Self> {
+        Figment::new()
+            .merge(Env::raw())
+            .extract()
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn database_url(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.postgres_user,
+            self.postgres_password,
+            self.postgres_host,
+            self.postgres_port,
+            self.postgres_orders_db
+        )
+    }
+}
