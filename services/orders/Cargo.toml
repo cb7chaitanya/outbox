@@ -24,3 +24,11 @@ uuid.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+messaging.workspace = true
+test-support.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+# Only for reading records back out of Redpanda in dual-write demonstration
+# tests (spec section 11); the service itself never consumes.
+rskafka.workspace = true
