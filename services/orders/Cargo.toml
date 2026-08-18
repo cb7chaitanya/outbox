@@ -18,3 +18,7 @@ tracing.workspace = true
 telemetry.workspace = true
 domain-common.workspace = true
 contracts.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true

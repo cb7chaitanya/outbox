@@ -1,4 +1,5 @@
 mod config;
+mod domain;
 mod http;
 
 use config::Config;
