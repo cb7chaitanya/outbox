@@ -31,6 +31,44 @@ fn sample_body() -> Value {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn correlation_id_is_echoed_when_supplied_and_generated_when_absent(pool: PgPool) {
+    let app: Router = orders::http::router(pool);
+
+    let supplied = uuid::Uuid::now_v7().to_string();
+    let mut with_header = post_order("corr-key-001", sample_body());
+    with_header
+        .headers_mut()
+        .insert("x-correlation-id", supplied.parse().unwrap());
+    let response = app.clone().oneshot(with_header).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let echoed = response
+        .headers()
+        .get("x-correlation-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(echoed, supplied);
+    let body = body_json(response).await;
+    assert_eq!(body["correlation_id"], supplied);
+
+    let without_header = post_order("corr-key-002", sample_body());
+    let response = app.oneshot(without_header).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let generated = response
+        .headers()
+        .get("x-correlation-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        uuid::Uuid::parse_str(&generated).is_ok(),
+        "a UUID must be generated when absent"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn create_then_get_order_and_transitions_round_trip(pool: PgPool) {
     let app: Router = orders::http::router(pool);
 

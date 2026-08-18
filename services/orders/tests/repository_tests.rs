@@ -4,6 +4,7 @@
 
 use chrono::Utc;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use orders::domain::{CreateOrderRequest, ItemRequest, OrderStatus, validate_and_normalize};
 use orders::repository::{self, TransitionError};
@@ -36,7 +37,7 @@ async fn concurrent_identical_idempotent_requests_yield_one_order(pool: PgPool) 
         let pool = pool.clone();
         let normalized = normalized.clone();
         handles.push(tokio::spawn(async move {
-            repository::create_order(&pool, key, &normalized, Utc::now()).await
+            repository::create_order(&pool, key, &normalized, Uuid::now_v7(), Utc::now()).await
         }));
     }
 
@@ -72,7 +73,7 @@ async fn concurrent_identical_idempotent_requests_yield_one_order(pool: PgPool) 
 async fn reused_idempotency_key_with_different_body_is_rejected(pool: PgPool) {
     let key = "reuse-key-001";
     let first = validate_and_normalize(sample_request()).unwrap();
-    repository::create_order(&pool, key, &first, Utc::now())
+    repository::create_order(&pool, key, &first, Uuid::now_v7(), Utc::now())
         .await
         .unwrap();
 
@@ -84,7 +85,7 @@ async fn reused_idempotency_key_with_different_body_is_rejected(pool: PgPool) {
     });
     let different = validate_and_normalize(different).unwrap();
 
-    let result = repository::create_order(&pool, key, &different, Utc::now()).await;
+    let result = repository::create_order(&pool, key, &different, Uuid::now_v7(), Utc::now()).await;
     assert!(
         matches!(result, Err(repository::RepoError::IdempotencyKeyReused)),
         "expected IdempotencyKeyReused, got {result:?}"
@@ -105,10 +106,10 @@ async fn same_key_same_body_replays_original_order(pool: PgPool) {
     let key = "replay-key-001";
     let normalized = validate_and_normalize(sample_request()).unwrap();
 
-    let first = repository::create_order(&pool, key, &normalized, Utc::now())
+    let first = repository::create_order(&pool, key, &normalized, Uuid::now_v7(), Utc::now())
         .await
         .unwrap();
-    let second = repository::create_order(&pool, key, &normalized, Utc::now())
+    let second = repository::create_order(&pool, key, &normalized, Uuid::now_v7(), Utc::now())
         .await
         .unwrap();
 
@@ -122,7 +123,7 @@ async fn same_key_same_body_replays_original_order(pool: PgPool) {
 
 async fn create_pending_order(pool: &PgPool, key: &str) -> repository::OrderRow {
     let normalized = validate_and_normalize(sample_request()).unwrap();
-    repository::create_order(pool, key, &normalized, Utc::now())
+    repository::create_order(pool, key, &normalized, Uuid::now_v7(), Utc::now())
         .await
         .unwrap()
         .order
@@ -259,7 +260,7 @@ async fn legal_transition_with_correct_version_succeeds_and_is_recorded(pool: Pg
 async fn transition_on_missing_order_is_not_found(pool: PgPool) {
     let result = repository::transition_order(
         &pool,
-        uuid::Uuid::now_v7(),
+        Uuid::now_v7(),
         1,
         OrderStatus::InventoryReserved,
         None,
