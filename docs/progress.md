@@ -3,7 +3,7 @@
 ## Milestone checklist
 
 - [x] M00 — Repository contract and skeleton
-- [ ] M01 — Orders API and local consistency
+- [x] M01 — Orders API and local consistency
 - [ ] M02 — Naive dual write and failure lab
 - [ ] M03 — Transactional outbox
 - [ ] M04 — Inventory consumer and idempotent inbox
@@ -17,10 +17,7 @@
 
 ## Current milestone
 
-M00 complete. Next action: M01 — orders migrations, domain state machine,
-create/get/transitions API, request validation, client idempotency,
-optimistic versioning, structured errors, and tests (no broker publish yet
-except a stub/port).
+M01 complete. Next action: M02 — naive dual write and failure lab.
 
 ## Decisions
 
@@ -40,6 +37,23 @@ except a stub/port).
   step in `make up` after the healthcheck passes.
 - Edition 2024, toolchain pinned to the installed stable 1.94.0
   (`rust-toolchain.toml`).
+- Idempotency-key race safety: `INSERT ... ON CONFLICT (idempotency_key)
+  DO NOTHING` rather than check-then-insert, relying on Postgres
+  serializing concurrent inserts on the same unique key. See
+  `docs/adr/0002-idempotency-key-race-safety.md`.
+- `orders` is a lib+bin crate (`src/lib.rs` + `src/main.rs`), not
+  bin-only — integration tests in `tests/` link the compiled library
+  instead of re-including source files with `#[path]`, which avoids a
+  false "dead code" state where the lint sees two independent, mostly-
+  unused copies of the same module.
+- Request-body idempotency comparison hashes a canonical form (items
+  sorted by SKU, currency) with SHA-256, so item reordering doesn't count
+  as "a different request" but a genuine content change does.
+- `correlation_id` is a real column on `orders` (added in a second,
+  additive migration after the initial schema was already applied and
+  committed, per the forward-only migration rule) even though spec
+  section 9's table listing doesn't show it — section 16 requires
+  persisting it, and it needs a home before M02+ events can carry it.
 
 ## Commands run and results (M00)
 
@@ -61,12 +75,30 @@ All commands below were actually run in this repository state on
 Infrastructure was left running (`docker compose up -d` state) after M00
 verification since the next milestone (M01) needs Postgres immediately.
 
+## Commands run and results (M01)
+
+All commands below were actually run in this repository state on
+2026-08-19, against the M00 infrastructure (still running). Full
+transcript excerpts, including the four M01 acceptance-gate proofs, are
+in `docs/evidence/m01.md`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 warnings |
+| `make test-unit` | all crates pass; orders lib: 10/10 |
+| `make test-integration` | orders repository tests: 7/7; orders HTTP tests: 7/7 |
+| `sqlx migrate run` (orders, both migrations) | applied cleanly against the running Postgres |
+| `cargo run -p orders` + curl (create/get/transitions/404/ready) | all responses match spec section 10 exactly (see evidence) |
+
+Total orders-service tests: 24 passed, 0 failed.
+
 ## Next action
 
-Start M01: orders service migrations (own database, `services/orders/migrations/`),
-`orders`/`order_items`/`order_transitions` tables per spec section 9,
-domain state machine, `POST /v1/orders` with `Idempotency-Key` handling,
-`GET /v1/orders/{id}`, `GET /v1/orders/{id}/transitions`, optimistic
-versioning, structured `application/problem+json` errors, and the M01
-acceptance tests (concurrent idempotent requests, reused-key conflict,
-overflow/invalid item validation, illegal/stale transitions).
+Start M02: naive direct-to-Kafka publish after DB commit, event
+contracts, the two deterministic fault points
+(`orders.after_db_commit_before_publish`,
+`orders.after_publish_before_response`), `scripts/demo-dual-write-
+failure.sh`, and `docs/failure-lab.md` explaining why retries alone
+cannot close the two atomicity gaps. Do not add outbox tables yet (spec
+section 11 / M03).
