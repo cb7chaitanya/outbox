@@ -1,5 +1,6 @@
 mod config;
 mod domain;
+mod errors;
 mod http;
 mod repository;
 
