@@ -1065,6 +1065,7 @@ name = "messaging"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "rskafka",
  "thiserror 2.0.20",
  "tokio",
