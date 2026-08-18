@@ -77,7 +77,7 @@ test-e2e:
 test: fmt lint test-unit test-integration
 
 demo-naive-failure:
-	@echo "demo-naive-failure: not yet implemented (lands with M02 dual-write failure lab)"
+	./scripts/demo-dual-write-failure.sh
 
 chaos-smoke:
 	@echo "chaos-smoke: not yet implemented (lands with M09 observability and chaos)"
