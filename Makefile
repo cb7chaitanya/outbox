@@ -61,14 +61,20 @@ lint:
 test-unit:
 	cargo test --workspace --lib --bins
 
+## Runs integration tests (tests/*.rs) against a real Postgres. Each
+## #[sqlx::test] gets its own ephemeral, migrated database, so DATABASE_URL
+## only needs to name a server the migrating user can create databases on.
 test-integration:
-	@echo "test-integration: not yet implemented (lands with M03/M04 outbox+inbox work)"
+	@test -f .env || (echo ".env not found; run 'make setup' first" && exit 1)
+	@set -a && . ./.env && set +a && \
+	DATABASE_URL="postgres://$$POSTGRES_USER:$$POSTGRES_PASSWORD@$$POSTGRES_HOST:$$POSTGRES_PORT/$$POSTGRES_ORDERS_DB" \
+	cargo test --workspace --tests
 
 test-e2e:
 	@echo "test-e2e: not yet implemented (lands with M06/M07 choreographed workflow)"
 
 ## Full required suite: format check, lint, and everything currently implemented.
-test: fmt lint test-unit
+test: fmt lint test-unit test-integration
 
 demo-naive-failure:
 	@echo "demo-naive-failure: not yet implemented (lands with M02 dual-write failure lab)"
