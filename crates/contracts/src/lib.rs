@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod orders;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<P> {
     pub event_id: Uuid,
