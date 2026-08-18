@@ -1,0 +1,7 @@
+/target
+**/target
+.env
+*.env.local
+.DS_Store
+/docker/volumes
+*.log
