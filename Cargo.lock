@@ -1163,16 +1163,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "contracts",
  "domain-common",
  "figment",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
+ "sqlx",
  "telemetry",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
