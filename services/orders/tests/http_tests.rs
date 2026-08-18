@@ -1,6 +1,8 @@
 //! HTTP-layer tests against a real Postgres database (spec section 18,
 //! section 20 M01 acceptance gates).
 
+mod common;
+
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -32,7 +34,7 @@ fn sample_body() -> Value {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn correlation_id_is_echoed_when_supplied_and_generated_when_absent(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
 
     let supplied = uuid::Uuid::now_v7().to_string();
     let mut with_header = post_order("corr-key-001", sample_body());
@@ -70,7 +72,7 @@ async fn correlation_id_is_echoed_when_supplied_and_generated_when_absent(pool: 
 
 #[sqlx::test(migrations = "./migrations")]
 async fn create_then_get_order_and_transitions_round_trip(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
 
     let create_response = app
         .clone()
@@ -123,7 +125,7 @@ async fn create_then_get_order_and_transitions_round_trip(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn concurrent_identical_http_requests_yield_one_order_and_same_response(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
 
     let mut handles = Vec::new();
     for _ in 0..8 {
@@ -164,7 +166,7 @@ async fn concurrent_identical_http_requests_yield_one_order_and_same_response(po
 
 #[sqlx::test(migrations = "./migrations")]
 async fn reused_idempotency_key_different_body_returns_409(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
 
     let first = app
         .clone()
@@ -188,7 +190,7 @@ async fn reused_idempotency_key_different_body_returns_409(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn missing_idempotency_key_returns_400(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
     let request = Request::builder()
         .method("POST")
         .uri("/v1/orders")
@@ -203,7 +205,7 @@ async fn missing_idempotency_key_returns_400(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn invalid_items_return_400_validation_failed(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
     let empty_items = json!({"items": [], "currency": "USD"});
     let response = app
         .oneshot(post_order("http-key-003", empty_items))
@@ -216,7 +218,7 @@ async fn invalid_items_return_400_validation_failed(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn get_missing_order_returns_404(pool: PgPool) {
-    let app: Router = orders::http::router(pool);
+    let app: Router = orders::http::router(common::noop_state(pool));
     let response = app
         .oneshot(
             Request::builder()
