@@ -1,10 +1,5 @@
-mod config;
-mod domain;
-mod errors;
-mod http;
-mod repository;
-
-use config::{Config, DatabaseConfig};
+use orders::config::{Config, DatabaseConfig};
+use orders::http;
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
