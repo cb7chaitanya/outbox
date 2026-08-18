@@ -7,6 +7,9 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use domain_common::Clock;
 
+pub mod fault;
+pub use fault::{FaultConfig, FaultInjector, FaultTriggered};
+
 /// A `Clock` whose value only advances when told to, for deterministic
 /// invariant tests (spec section 18).
 pub struct FakeClock(Mutex<DateTime<Utc>>);

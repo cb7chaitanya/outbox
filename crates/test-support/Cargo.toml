@@ -8,3 +8,5 @@ publish.workspace = true
 [dependencies]
 domain-common.workspace = true
 chrono.workspace = true
+tokio.workspace = true
+serde.workspace = true
