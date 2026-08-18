@@ -30,6 +30,7 @@ pub struct OrderRow {
     pub amount_minor: i64,
     pub version: i64,
     pub cancellation_reason: Option<String>,
+    pub correlation_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -54,7 +55,7 @@ pub struct TransitionRow {
 }
 
 const ORDER_COLUMNS: &str = "id, idempotency_key, idempotency_request_hash, status, \
-     currency, amount_minor, version, cancellation_reason, created_at, updated_at";
+     currency, amount_minor, version, cancellation_reason, correlation_id, created_at, updated_at";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
@@ -105,6 +106,7 @@ pub async fn create_order(
     pool: &PgPool,
     idempotency_key: &str,
     normalized: &NormalizedOrder,
+    correlation_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<CreateOutcome, RepoError> {
     let request_hash = fingerprint(normalized);
@@ -114,8 +116,8 @@ pub async fn create_order(
 
     let insert_sql = format!(
         "insert into orders (id, idempotency_key, idempotency_request_hash, status, \
-         currency, amount_minor, version, created_at, updated_at) \
-         values ($1, $2, $3, 'PENDING', $4, $5, 1, $6, $6) \
+         currency, amount_minor, version, correlation_id, created_at, updated_at) \
+         values ($1, $2, $3, 'PENDING', $4, $5, 1, $6, $7, $7) \
          on conflict (idempotency_key) do nothing \
          returning {ORDER_COLUMNS}"
     );
@@ -125,6 +127,7 @@ pub async fn create_order(
         .bind(&request_hash)
         .bind(&normalized.currency)
         .bind(normalized.amount_minor)
+        .bind(correlation_id)
         .bind(now)
         .fetch_optional(&mut *tx)
         .await?;
