@@ -7,7 +7,7 @@
 - [x] M02 — Naive dual write and failure lab
 - [x] M03 — Transactional outbox
 - [x] M04 — Inventory consumer and idempotent inbox
-- [ ] M05 — Payments with retry taxonomy
+- [x] M05 — Payments with retry taxonomy
 - [ ] M06 — Choreographed workflow and compensation
 - [ ] M07 — Fulfilment and complete compensation matrix
 - [ ] M08 — Ordering, replay, and concurrency hardening
@@ -17,7 +17,7 @@
 
 ## Current milestone
 
-M04 complete. Next action: M05 — payments with retry taxonomy.
+M05 complete. Next action: M06 — choreographed workflow and compensation.
 
 ## Decisions
 
@@ -125,6 +125,41 @@ M04 complete. Next action: M05 — payments with retry taxonomy.
   `create_order`), because the consumer handler must apply it, insert the
   resulting outbox event, advance the consumer-version row, and mark the
   inbox row processed all in one transaction (spec section 14 steps 4-7).
+- Section 15's error-classification taxonomy (`ErrorClass`:
+  Transient/Contention/RateLimited/Permanent/Poison) lives in
+  `domain-common`, not `persistence` — it's a vocabulary type any
+  service's error enum can map onto, not persistence-specific.
+- M05 judgment call: orders gets a new consumer (`outcome_consumer`)
+  reacting to `inventory.reservation_succeeded`/`reservation_failed` on
+  `inventory.events.v1` — transitioning the order and emitting
+  `payments.authorize_payment` on success, deliberately doing nothing on
+  failure beyond the inbox mark. Full compensation (release inventory,
+  drive to `CANCELLING`/`CANCELLED`) is M06's named deliverable. See
+  `docs/adr/0010-orders-consumes-reservation-outcomes.md`.
+  **M06 must add:** the `reservation_failed` reaction (compensation), and
+  a real per-order per-downstream-consumer command-version counter before
+  adding `refund_payment` as a second command on the orders→payments
+  relationship (see the ADR's "a bug this wiring surfaced" section — the
+  current `authorize_payment` envelope hardcodes `aggregate_version: 1`,
+  which only stays correct while it's the only command on that
+  relationship).
+- The fake payment provider (`payments::provider::FakeProvider`) keeps
+  its own in-process idempotency-key ledger, independent of the
+  `payment_operations` table (this service's own bookkeeping of what it
+  asked the provider to do). Three idempotency layers now stack across
+  the payments consumer: inbox event-id dedup (redelivery), the
+  `payments.order_id` unique constraint (a second command instance for
+  the same order), and the provider's own ledger (this handler's own
+  retry loop). Each covers a different failure mode.
+- The provider retry loop runs inside the same transaction as the inbox
+  claim, unlike the outbox publisher's "never hold a transaction open
+  during I/O" rule — accepted because the fake provider has no real
+  network I/O. See
+  `docs/adr/0009-payments-provider-retry-inside-transaction.md`.
+- `authorize_payment`/`refund_payment` share one topic
+  (`payments.commands.v1`); the consumer dispatches on `event_type`
+  rather than running two separate consumer loops, since both need the
+  identical eight-step protocol and per-order version tracking.
 
 ## Commands run and results (M00)
 
@@ -227,21 +262,54 @@ Total inventory-service tests: 10 passed, 0 failed (5 unit + 5
 integration). Workspace-wide test count now in the 70s across all
 crates/services.
 
+## Commands run and results (M05)
+
+All commands below were actually run in this repository state on
+2026-08-19, against the M00-M04 infrastructure (still running). Full
+transcript excerpts, including all five M05 acceptance-gate proofs and a
+live end-to-end order → reservation → authorization check (plus the
+version-gap bug it caught and the fix), are in `docs/evidence/m05.md`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 warnings |
+| `cargo build --workspace` | success |
+| `cargo test -p payments --lib` | 6/6 (fake provider unit tests) |
+| `cargo test -p payments --test consumer_tests` | 5/5, all five M05 acceptance gates |
+| same, repeated 3x with `--test-threads=1` | 5/5 every run, no flakes |
+| `cargo test -p orders --tests` | 20/20 (no regression from M01-M03) |
+| `cargo test -p inventory --tests` | 10/10 (no regression from M04) |
+| `make demo-naive-failure` | exit 0; M02 lab still reproduces both gaps unchanged |
+| live: `cargo run -p orders/inventory/payments`, seed stock, `POST /v1/orders`, poll order + query `payments` table | `PENDING`→`INVENTORY_RESERVED` in ~1s; one `AUTHORIZED` payments row with a real `provider_reference` |
+
+Total payments-service tests: 11 passed, 0 failed (6 unit + 5
+integration). Workspace-wide test count now in the 90s across all
+crates/services.
+
 ## Next action
 
-Start M05: payments with retry taxonomy. Implement the fake payment
-provider (deterministic, in-process — no real network dependency),
-`payments` service migrations (`payments`, `payment_operations` per spec
-section 9), authorization/refund handlers wired the same way inventory's
-consumer is (idempotent inbox, its own outbox), the full error-
-classification table from section 15 (transient/contention/rate-limited/
-permanent/poison) driving actual retry behavior — this is the milestone
-that owns that taxonomy, deferred by ADR 0005 and ADR 0008's scope notes
-— full-jitter backoff with retry budgets, and deterministic fault tests
-(timeout-then-success, lost-success-response-then-retry, decline,
-poison-input, idempotent refund). Payments only begins authorization
-after `reservation_succeeded` — since M05 lands before M06's full
-choreography wiring, follow M04's precedent (ADR 0007): decide whether
-orders emits an explicit `payments.authorize_payment` command now (mirroring
-how it now emits `reserve_inventory`) or whether that wiring waits for
-M06, and document the choice in an ADR rather than leaving it implicit.
+Start M06: choreographed workflow and compensation. Two things M05
+explicitly deferred and named as M06 prerequisites (see ADR 0010 and the
+Decisions section above):
+
+1. Wire the `reservation_failed` reaction in orders'
+   `outcome_consumer` — release nothing yet (no payment was attempted),
+   but drive the order to `CANCELLING`/`CANCELLED` per spec section 12's
+   compensation matrix's first row ("inventory rejected: no payment
+   attempted; cancel").
+2. Replace `outcome_consumer`'s hardcoded
+   `FIRST_PAYMENTS_COMMAND_VERSION = 1` with a real per-order,
+   per-downstream-consumer version counter before adding
+   `refund_payment` as a second command on the orders→payments
+   relationship — the current constant only stays correct while
+   `authorize_payment` is the only command orders ever sends to payments.
+
+Beyond those two, M06 wires the remaining compensation matrix rows
+(payment failed after reservation → release inventory, cancel after
+release confirmation; compensation transient failure → bounded retry;
+compensation retry budget exhausted → `MANUAL_REVIEW`), which needs new
+`inventory.release_inventory`/`inventory_released` and
+`payments.refund_payment`/`payment_refunded` wiring on the orders side
+(the payments side of refund already exists as of M05), and duplicated/
+reordered-outcome tests proving no illegal transitions occur.

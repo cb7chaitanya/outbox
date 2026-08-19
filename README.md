@@ -8,7 +8,7 @@ optional saga orchestrator — until the same failures are handled
 correctly. See `PROJECT_2_SPEC.md` for the full contract this repository
 implements, milestone by milestone.
 
-## What's built so far (M00-M04)
+## What's built so far (M00-M05)
 
 Workspace scaffolding (M00), the orders service's local-consistency core
 (M01: idempotent order creation, versioned state machine, transition
@@ -29,10 +29,25 @@ sorted-order row locking (never oversells, never partially reserves a
 multi-SKU request), reply with `reservation_succeeded`/`reservation_failed`
 through its own outbox, and dead-letter anything it can't process
 (malformed envelope, unsupported schema, out-of-order gap) without
-blocking the rest of the partition. The naive publish path from M02 stays
-runnable behind `DELIVERY_MODE=naive` so its failure lab remains
-reproducible; `DELIVERY_MODE=outbox` is the default. Payments and
-fulfilment remain health-endpoint skeletons (M05+). Track progress in
+blocking the rest of the partition.
+
+M05 adds the `payments` service and closes the loop on the happy path:
+`orders` now also consumes `reservation_succeeded`/`reservation_failed`
+from `inventory.events.v1`, transitions the order to
+`INVENTORY_RESERVED`, and emits `payments.authorize_payment` — all in one
+transaction (see `docs/adr/0010-orders-consumes-reservation-outcomes.md`;
+the `reservation_failed` reaction is deliberately deferred to M06's
+compensation matrix). `payments` authorizes against an in-process fake
+provider that honors its own idempotency keys independently of this
+service's inbox/outbox layers, applies spec section 15's error
+classification and full-jitter-backoff retry budget around it, and emits
+`payment_authorized`/`payment_failed`/`payment_refunded`. A real
+`POST /v1/orders` now reaches an `AUTHORIZED` payment in well under a
+second with no manual steps — see `docs/evidence/m05.md` for a live,
+end-to-end transcript. The naive publish path from M02 stays runnable
+behind `DELIVERY_MODE=naive` so its failure lab remains reproducible;
+`DELIVERY_MODE=outbox` is the default. Fulfilment remains a
+health-endpoint skeleton (M07). Track progress in
 [`docs/progress.md`](docs/progress.md).
 
 ## Architecture
@@ -222,8 +237,28 @@ to `inventory.commands.v1.dlq` without blocking other messages on the
 partition (invariant I15). Deterministic, automated demonstrations of all
 five M04 acceptance gates: `services/inventory/tests/consumer_tests.rs`.
 
-This section grows as later milestones (payments/fulfilment consumers,
-choreography, M05+) land; see `docs/progress.md` for current status.
+**Payments with retry taxonomy (M05):** on `reservation_succeeded`,
+`orders` transitions the order to `INVENTORY_RESERVED` and emits
+`payments.authorize_payment` — in the same transaction as the transition
+itself (`repository::transition_order_with_outbox`), so "reacted to the
+outcome" and "asked payments to authorize" are one atomic business
+change, not two (see `docs/adr/0010-orders-consumes-reservation-outcomes.md`).
+`payments` runs the same eight-step idempotent-inbox protocol as
+inventory, dispatching `authorize_payment`/`refund_payment` off one
+shared topic by `event_type`. Authorization calls an in-process fake
+provider that keeps its own idempotency-key ledger independent of this
+service's inbox/outbox tables — a redelivered or retried call is a cache
+hit there, never a second charge — wrapped in a bounded, full-jitter-
+backoff retry loop (spec section 15 defaults: base 100ms, cap 30s, max 8
+attempts, max elapsed 10 minutes) that only retries transient failures; a
+provider decline is a final business outcome (`payment_failed`), never
+retried, never DLQ'd. Refunds are idempotent the same way. Deterministic,
+automated demonstrations of all five M05 acceptance gates (timeout-then-
+success, lost-response-then-retry, decline, poison-DLQ, idempotent
+refund): `services/payments/tests/consumer_tests.rs`.
+
+This section grows as later milestones (fulfilment, choreography
+compensation, M06+) land; see `docs/progress.md` for current status.
 
 ## Delivery semantics
 
@@ -236,7 +271,7 @@ claim of end-to-end exactly-once delivery. See spec section 5.
 make fmt              # cargo fmt --all
 make lint              # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test-unit          # cargo test --workspace --lib --bins
-make test-integration    # real Postgres/Redpanda integration tests (orders + inventory)
+make test-integration    # real Postgres/Redpanda integration tests (orders + inventory + payments)
 make test-e2e             # not yet implemented (M06/M07)
 make test                  # fmt + lint + test-unit + test-integration
 make demo-naive-failure     # runs both dual-write failure demonstrations live (M02)
