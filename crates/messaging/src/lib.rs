@@ -129,7 +129,12 @@ mod live_tests {
             .await
             .expect("connect to redpanda");
         producer
-            .publish("orders.events.v1", "smoke-test-key", b"hello".to_vec(), vec![])
+            .publish(
+                "orders.events.v1",
+                "smoke-test-key",
+                b"hello".to_vec(),
+                vec![],
+            )
             .await
             .expect("publish succeeds");
     }

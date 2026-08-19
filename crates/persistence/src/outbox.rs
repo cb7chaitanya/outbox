@@ -122,7 +122,11 @@ pub async fn claim_batch(
     .await
 }
 
-pub async fn mark_published(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<(), sqlx::Error> {
+pub async fn mark_published(
+    pool: &PgPool,
+    id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query("update outbox_events set published_at = $1 where id = $2")
         .bind(now)
         .bind(id)
@@ -162,7 +166,10 @@ pub struct BacklogMetrics {
 
 /// Backs the `/metrics` backlog-count and oldest-unpublished-age gauges
 /// (spec section 16).
-pub async fn backlog_metrics(pool: &PgPool, now: DateTime<Utc>) -> Result<BacklogMetrics, sqlx::Error> {
+pub async fn backlog_metrics(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<BacklogMetrics, sqlx::Error> {
     let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
         "select count(*), min(created_at) from outbox_events where published_at is null",
     )
@@ -271,12 +278,21 @@ pub async fn run_publisher_once(
     metrics: &PublishMetrics,
     now: DateTime<Utc>,
 ) -> Result<usize, sqlx::Error> {
-    let claimed = claim_batch(pool, &config.claimed_by, config.lease, config.batch_size, now).await?;
+    let claimed = claim_batch(
+        pool,
+        &config.claimed_by,
+        config.lease,
+        config.batch_size,
+        now,
+    )
+    .await?;
     let count = claimed.len();
 
     for row in claimed {
         if row.was_previously_claimed {
-            metrics.lease_recoveries_total.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .lease_recoveries_total
+                .fetch_add(1, Ordering::Relaxed);
         }
         metrics.attempts_total.fetch_add(1, Ordering::Relaxed);
 
@@ -306,7 +322,11 @@ pub async fn run_publisher_once(
             }
             Err(err) => {
                 metrics.failures_total.fetch_add(1, Ordering::Relaxed);
-                let backoff = full_jitter_backoff(row.attempts as u32, config.backoff_base, config.backoff_cap);
+                let backoff = full_jitter_backoff(
+                    row.attempts as u32,
+                    config.backoff_base,
+                    config.backoff_cap,
+                );
                 let next_attempt_at = Utc::now()
                     + ChronoDuration::from_std(backoff).unwrap_or(ChronoDuration::zero());
                 mark_failed(pool, row.id, next_attempt_at, &err.to_string()).await?;
@@ -332,9 +352,15 @@ pub fn spawn_publisher_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let outcome =
-                run_publisher_once(&pool, producer.as_ref(), &fault_injector, &config, &metrics, Utc::now())
-                    .await;
+            let outcome = run_publisher_once(
+                &pool,
+                producer.as_ref(),
+                &fault_injector,
+                &config,
+                &metrics,
+                Utc::now(),
+            )
+            .await;
             match outcome {
                 Ok(n) if n > 0 => continue,
                 Ok(_) => {}
@@ -355,7 +381,10 @@ mod tests {
         let cap = StdDuration::from_secs(30);
         for attempts in 0..40 {
             let delay = full_jitter_backoff(attempts, base, cap);
-            assert!(delay <= cap, "attempts={attempts} produced {delay:?} > cap {cap:?}");
+            assert!(
+                delay <= cap,
+                "attempts={attempts} produced {delay:?} > cap {cap:?}"
+            );
         }
     }
 

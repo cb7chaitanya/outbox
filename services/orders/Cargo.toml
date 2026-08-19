@@ -27,6 +27,7 @@ hex.workspace = true
 messaging.workspace = true
 test-support.workspace = true
 async-trait.workspace = true
+persistence.workspace = true
 
 [dev-dependencies]
 # Only for reading records back out of Redpanda in dual-write demonstration

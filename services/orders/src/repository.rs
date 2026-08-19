@@ -13,6 +13,7 @@
 //! happens at all.
 
 use chrono::{DateTime, Utc};
+use persistence::outbox::NewOutboxEvent;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -102,12 +103,22 @@ fn fingerprint(normalized: &NormalizedOrder) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Called only when a new order row is genuinely inserted by this call
+/// (never on an idempotent replay, per invariant I3 — a replay isn't a new
+/// business state change, so it gets no new outbox row), given the
+/// order's freshly generated id and version. Returning `None` means no
+/// event is required for this delivery mode (e.g. `DELIVERY_MODE=naive`,
+/// which still publishes directly, outside any transaction).
+pub trait OutboxEventBuilder: FnOnce(Uuid, i64) -> Option<NewOutboxEvent> {}
+impl<F: FnOnce(Uuid, i64) -> Option<NewOutboxEvent>> OutboxEventBuilder for F {}
+
 pub async fn create_order(
     pool: &PgPool,
     idempotency_key: &str,
     normalized: &NormalizedOrder,
     correlation_id: Uuid,
     now: DateTime<Utc>,
+    build_outbox_event: impl OutboxEventBuilder,
 ) -> Result<CreateOutcome, RepoError> {
     let request_hash = fingerprint(normalized);
     let order_id = Uuid::now_v7();
@@ -178,6 +189,10 @@ pub async fn create_order(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+
+    if let Some(event) = build_outbox_event(order.id, order.version) {
+        persistence::outbox::insert(&mut tx, now, &event).await?;
+    }
 
     tx.commit().await?;
 
