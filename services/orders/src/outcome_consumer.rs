@@ -1,17 +1,35 @@
-//! Consumes reservation outcomes from `inventory.events.v1` (spec section
-//! 12: "Payment authorization begins only after reservation succeeds") and
-//! reacts just enough to make the payments service (M05) exercisable
-//! end-to-end: on `reservation_succeeded`, transition the order to
-//! `INVENTORY_RESERVED` and emit `payments.authorize_payment` through the
-//! outbox, in one transaction ([`crate::repository::transition_order_with_outbox`]).
+//! Consumes downstream outcomes orders reacts to (spec section 12): from
+//! `inventory.events.v1` (`reservation_succeeded`, `reservation_failed`,
+//! `inventory_released`) and from `payments.events.v1`
+//! (`payment_authorized`, `payment_failed`). One module, one consumer name,
+//! two topics — `process_available` is called once per topic by two
+//! background loops (`main.rs`); dispatch inside `handle_one` is on
+//! `event_type`, which is unique across both topics, so nothing here needs
+//! to know which topic a record came from beyond what it fetched it from.
 //!
-//! `reservation_failed` is intentionally a no-op beyond marking the inbox
-//! record processed: driving the order to `CANCELLING`/`CANCELLED` is the
-//! compensation matrix's job (spec section 12), which M06 implements in
-//! full. Wiring only the success half here — rather than a half-finished
-//! cancellation path — keeps this milestone's scope to "prove payments
-//! works end-to-end," documented in
-//! `docs/adr/0010-orders-consumes-reservation-outcomes.md`.
+//! M06 wires the full choreography-first happy path through
+//! `PAYMENT_AUTHORIZED` and the first two rows of the compensation matrix:
+//!
+//! - `reservation_succeeded` -> `INVENTORY_RESERVED`, records
+//!   `reservation_id` (needed later to release it), emits
+//!   `authorize_payment`.
+//! - `reservation_failed` -> `CANCELLING` -> `CANCELLED` directly (nothing
+//!   was ever reserved or paid, so no compensation command is needed —
+//!   matrix row 1).
+//! - `payment_authorized` -> `PAYMENT_AUTHORIZED`. M06 stops here; driving
+//!   fulfilment readiness is M07's job.
+//! - `payment_failed` -> `CANCELLING`, emits `release_inventory` (matrix
+//!   row 2).
+//! - `inventory_released` -> `CANCELLED` (the release confirmation matrix
+//!   row 2 waits for before finalizing).
+//!
+//! Rows 3 and 4 of the compensation matrix (fulfilment failure -> refund +
+//! release; compensation retry exhaustion -> `MANUAL_REVIEW`) depend on
+//! fulfilment, which doesn't exist until M07 — not implemented here. See
+//! `docs/progress.md` for the scope boundary and
+//! `docs/adr/0010-orders-consumes-reservation-outcomes.md` /
+//! `docs/adr/0011-per-target-command-version-counter.md` for the M05
+//! groundwork and version-counter fix this builds on.
 //!
 //! Structurally this is the same eight-step idempotent-inbox protocol as
 //! `inventory::consumer` and `payments::consumer`; see those for the
@@ -20,13 +38,18 @@
 use chrono::Utc;
 use contracts::Envelope;
 use contracts::inventory::{
-    RESERVATION_FAILED_EVENT_TYPE, RESERVATION_FAILED_SCHEMA_VERSION,
-    RESERVATION_SUCCEEDED_EVENT_TYPE, RESERVATION_SUCCEEDED_SCHEMA_VERSION,
-    ReservationFailedPayload, ReservationSucceededPayload,
+    INVENTORY_COMMANDS_TOPIC, INVENTORY_RELEASED_EVENT_TYPE, INVENTORY_RELEASED_SCHEMA_VERSION,
+    InventoryReleasedPayload, RELEASE_INVENTORY_AGGREGATE_TYPE, RELEASE_INVENTORY_COMMAND_TYPE,
+    RELEASE_INVENTORY_SCHEMA_VERSION, RESERVATION_FAILED_EVENT_TYPE,
+    RESERVATION_FAILED_SCHEMA_VERSION, RESERVATION_SUCCEEDED_EVENT_TYPE,
+    RESERVATION_SUCCEEDED_SCHEMA_VERSION, ReleaseInventoryPayload, ReservationFailedPayload,
+    ReservationSucceededPayload,
 };
 use contracts::payments::{
     AUTHORIZE_PAYMENT_COMMAND_TYPE, AUTHORIZE_PAYMENT_SCHEMA_VERSION, AuthorizePaymentPayload,
-    PAYMENT_COMMAND_AGGREGATE_TYPE, PAYMENTS_COMMANDS_TOPIC, PaymentAmount,
+    PAYMENT_AUTHORIZED_EVENT_TYPE, PAYMENT_AUTHORIZED_SCHEMA_VERSION,
+    PAYMENT_COMMAND_AGGREGATE_TYPE, PAYMENT_FAILED_EVENT_TYPE, PAYMENT_FAILED_SCHEMA_VERSION,
+    PAYMENTS_COMMANDS_TOPIC, PaymentAmount, PaymentAuthorizedPayload, PaymentFailedPayload,
 };
 use messaging::{ConsumedRecord, Consumer, Producer};
 use persistence::dlq::DlqRecord;
@@ -96,26 +119,10 @@ async fn publish_dlq(
     persistence::dlq::publish(producer, source_topic, key, &dlq_record).await
 }
 
-/// `aggregate_version` here is deliberately **not** the order's own
-/// version (which is 2 by the time this command is built, since the
-/// reservation-success transition already happened) — it's this
-/// command's position in the orders→payments command stream specifically,
-/// which the payments consumer tracks independently via its own
-/// `(consumer_name, aggregate_id)` row (spec section 14). Using the
-/// order's global version here would make payments see a gap on its very
-/// first message for this order (last_version 0, incoming 2), since
-/// payments never receives a message at order-version 1 — that one went
-/// to inventory instead. `1` is correct because this is, in this
-/// milestone's scope, the only command orders ever sends to payments for
-/// a given order; M06 (refunds are the second such command) must turn
-/// this into a real per-order, per-downstream-consumer counter rather
-/// than a constant. See
-/// `docs/adr/0010-orders-consumes-reservation-outcomes.md`.
-const FIRST_PAYMENTS_COMMAND_VERSION: i64 = 1;
-
 fn build_authorize_payment_event(
     envelope: &Envelope<serde_json::Value>,
     order_id: Uuid,
+    command_version: i64,
     currency: &str,
     amount_minor: i64,
 ) -> NewOutboxEvent {
@@ -129,7 +136,7 @@ fn build_authorize_payment_event(
         producer: "orders".to_string(),
         aggregate_type: PAYMENT_COMMAND_AGGREGATE_TYPE.to_string(),
         aggregate_id: order_id,
-        aggregate_version: FIRST_PAYMENTS_COMMAND_VERSION,
+        aggregate_version: command_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
         traceparent: None,
@@ -146,17 +153,68 @@ fn build_authorize_payment_event(
         id: event_id,
         aggregate_type: PAYMENT_COMMAND_AGGREGATE_TYPE.to_string(),
         aggregate_id: order_id,
-        aggregate_version: FIRST_PAYMENTS_COMMAND_VERSION,
+        aggregate_version: command_version,
         topic: PAYMENTS_COMMANDS_TOPIC.to_string(),
         message_key: order_id.to_string(),
         envelope: serde_json::to_value(&inner).expect("envelope serializes"),
     }
 }
 
-/// Runs the eight-step protocol for one reservation-outcome record. Never
-/// returns `Err` for a business-level problem with the message itself —
-/// those are DLQ'd and reported as `Poison`; `Err` is reserved for
-/// infrastructure failures that should stop the batch.
+fn build_release_inventory_event(
+    envelope: &Envelope<serde_json::Value>,
+    order_id: Uuid,
+    reservation_id: Uuid,
+    command_version: i64,
+    reason: &str,
+) -> NewOutboxEvent {
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: RELEASE_INVENTORY_COMMAND_TYPE.to_string(),
+        schema_version: RELEASE_INVENTORY_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: "orders".to_string(),
+        aggregate_type: RELEASE_INVENTORY_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: ReleaseInventoryPayload {
+            order_id,
+            reservation_id,
+            reason: reason.to_string(),
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: RELEASE_INVENTORY_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        topic: INVENTORY_COMMANDS_TOPIC.to_string(),
+        message_key: order_id.to_string(),
+        envelope: serde_json::to_value(&inner).expect("envelope serializes"),
+    }
+}
+
+/// A redelivery-shaped race (this event reprocessed after the order
+/// already advanced past the status this transition requires through some
+/// other path) is not this consumer's job to force through, and not a
+/// poison message either — the inbox mark below still commits so this
+/// exact event id doesn't retry forever.
+fn log_illegal_transition_race(order_id: Uuid, from: OrderStatus, to: OrderStatus) {
+    tracing::warn!(
+        order_id = %order_id,
+        %from,
+        %to,
+        "outcome arrived for an order no longer eligible for this transition"
+    );
+}
+
+/// Runs the eight-step protocol for one reservation- or payment-outcome
+/// record. Never returns `Err` for a business-level problem with the
+/// message itself — those are DLQ'd and reported as `Poison`; `Err` is
+/// reserved for infrastructure failures that should stop the batch.
 async fn handle_one(
     pool: &PgPool,
     producer: &dyn Producer,
@@ -207,6 +265,9 @@ async fn handle_one(
     let expected_schema_version = match envelope.event_type.as_str() {
         RESERVATION_SUCCEEDED_EVENT_TYPE => RESERVATION_SUCCEEDED_SCHEMA_VERSION,
         RESERVATION_FAILED_EVENT_TYPE => RESERVATION_FAILED_SCHEMA_VERSION,
+        INVENTORY_RELEASED_EVENT_TYPE => INVENTORY_RELEASED_SCHEMA_VERSION,
+        PAYMENT_AUTHORIZED_EVENT_TYPE => PAYMENT_AUTHORIZED_SCHEMA_VERSION,
+        PAYMENT_FAILED_EVENT_TYPE => PAYMENT_FAILED_SCHEMA_VERSION,
         _ => {
             publish_dlq(
                 producer,
@@ -314,102 +375,276 @@ async fn handle_one(
     // above (still open as `tx`) so the inbox mark and the reaction commit
     // or roll back together — a crash between them must not leave the
     // event marked processed with no reaction ever having happened.
-    if envelope.event_type == RESERVATION_SUCCEEDED_EVENT_TYPE {
-        let payload: ReservationSucceededPayload =
-            match serde_json::from_value(envelope.payload.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tx.rollback().await?;
-                    publish_dlq(
-                        producer,
-                        source_topic,
-                        &key,
-                        record,
-                        Some(serde_json::to_value(&envelope).unwrap_or_default()),
-                        "MALFORMED_PAYLOAD",
-                        format!("payload did not match reservation_succeeded shape: {e}"),
-                    )
-                    .await?;
-                    return Ok(HandleOutcome::Poison);
-                }
-            };
-        let order_money = sqlx::query_as::<_, (String, i64)>(
-            "select currency, amount_minor from orders where id = $1",
-        )
-        .bind(payload.order_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((currency, amount_minor)) = order_money else {
-            tx.rollback().await?;
-            publish_dlq(
-                producer,
-                source_topic,
-                &key,
-                record,
-                Some(serde_json::to_value(&envelope).unwrap_or_default()),
-                "UNKNOWN_ORDER",
-                format!(
-                    "reservation_succeeded for unknown order {}",
-                    payload.order_id
-                ),
+    let outcome_result: Result<(), TransitionError> = match envelope.event_type.as_str() {
+        RESERVATION_SUCCEEDED_EVENT_TYPE => {
+            let payload: ReservationSucceededPayload =
+                match serde_json::from_value(envelope.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tx.rollback().await?;
+                        publish_dlq(
+                            producer,
+                            source_topic,
+                            &key,
+                            record,
+                            Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                            "MALFORMED_PAYLOAD",
+                            format!("payload did not match reservation_succeeded shape: {e}"),
+                        )
+                        .await?;
+                        return Ok(HandleOutcome::Poison);
+                    }
+                };
+            let order_money = sqlx::query_as::<_, (String, i64)>(
+                "select currency, amount_minor from orders where id = $1",
             )
+            .bind(payload.order_id)
+            .fetch_optional(&mut *tx)
             .await?;
-            return Ok(HandleOutcome::Poison);
-        };
-        let envelope_for_event = envelope.clone();
-        let result = repository::transition_order_with_outbox(
-            &mut tx,
-            payload.order_id,
-            OrderStatus::InventoryReserved,
-            Some("inventory reservation succeeded"),
-            Some(envelope.event_id),
-            now,
-            move |order_id, _order_version| {
-                vec![build_authorize_payment_event(
-                    &envelope_for_event,
-                    order_id,
-                    &currency,
-                    amount_minor,
-                )]
-            },
-        )
-        .await;
-        match result {
-            Ok(_) => {}
-            Err(TransitionError::IllegalTransition { from, to }) => {
-                // Redelivery-shaped race (e.g. this event reprocessed after
-                // the order already advanced past PENDING through some
-                // other path): not this consumer's job to force it, and
-                // not a poison message either — still commits the inbox
-                // mark below so this exact event id doesn't retry forever.
-                tracing::warn!(order_id = %payload.order_id, %from, %to, "reservation_succeeded arrived for an order no longer eligible for this transition");
-            }
-            Err(e) => return Err(e.into()),
-        }
-    } else {
-        let payload: ReservationFailedPayload =
-            match serde_json::from_value(envelope.payload.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tx.rollback().await?;
-                    publish_dlq(
-                        producer,
-                        source_topic,
-                        &key,
-                        record,
-                        Some(serde_json::to_value(&envelope).unwrap_or_default()),
-                        "MALFORMED_PAYLOAD",
-                        format!("payload did not match reservation_failed shape: {e}"),
-                    )
-                    .await?;
-                    return Ok(HandleOutcome::Poison);
-                }
+            let Some((currency, amount_minor)) = order_money else {
+                tx.rollback().await?;
+                publish_dlq(
+                    producer,
+                    source_topic,
+                    &key,
+                    record,
+                    Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                    "UNKNOWN_ORDER",
+                    format!(
+                        "reservation_succeeded for unknown order {}",
+                        payload.order_id
+                    ),
+                )
+                .await?;
+                return Ok(HandleOutcome::Poison);
             };
-        // M06 scope (spec section 12's compensation matrix): drive the
-        // order to CANCELLING/CANCELLED here. For M05, recording that this
-        // consumer saw the failure (via the inbox mark below) is enough to
-        // keep it from blocking; see docs/adr/0010.
-        tracing::info!(order_id = %payload.order_id, reason_code = %payload.reason_code, "reservation failed; compensation wiring lands in M06");
+            let payments_command_version =
+                repository::reserve_command_version(&mut tx, payload.order_id, "payments").await?;
+            let envelope_for_event = envelope.clone();
+            let reservation_id = payload.reservation_id;
+            let order_id = payload.order_id;
+            repository::transition_order_with_outbox(
+                &mut tx,
+                order_id,
+                OrderStatus::InventoryReserved,
+                Some("inventory reservation succeeded"),
+                Some(envelope.event_id),
+                Some(reservation_id),
+                now,
+                move |order_id, _order_version| {
+                    vec![build_authorize_payment_event(
+                        &envelope_for_event,
+                        order_id,
+                        payments_command_version,
+                        &currency,
+                        amount_minor,
+                    )]
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+        RESERVATION_FAILED_EVENT_TYPE => {
+            let payload: ReservationFailedPayload =
+                match serde_json::from_value(envelope.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tx.rollback().await?;
+                        publish_dlq(
+                            producer,
+                            source_topic,
+                            &key,
+                            record,
+                            Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                            "MALFORMED_PAYLOAD",
+                            format!("payload did not match reservation_failed shape: {e}"),
+                        )
+                        .await?;
+                        return Ok(HandleOutcome::Poison);
+                    }
+                };
+            // Compensation matrix row 1 (spec section 12): nothing was ever
+            // reserved or paid, so cancellation needs no compensation
+            // command -- straight to CANCELLING then CANCELLED, in the
+            // same transaction.
+            let cancelling = repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::Cancelling,
+                Some(payload.reason_code.as_str()),
+                Some(envelope.event_id),
+                None,
+                now,
+                |_, _| Vec::new(),
+            )
+            .await;
+            match cancelling {
+                Ok(_) => repository::transition_order_with_outbox(
+                    &mut tx,
+                    payload.order_id,
+                    OrderStatus::Cancelled,
+                    Some("inventory reservation rejected; nothing to compensate"),
+                    Some(envelope.event_id),
+                    None,
+                    now,
+                    |_, _| Vec::new(),
+                )
+                .await
+                .map(|_| ()),
+                Err(TransitionError::IllegalTransition { from, to }) => {
+                    log_illegal_transition_race(payload.order_id, from, to);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        INVENTORY_RELEASED_EVENT_TYPE => {
+            let payload: InventoryReleasedPayload =
+                match serde_json::from_value(envelope.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tx.rollback().await?;
+                        publish_dlq(
+                            producer,
+                            source_topic,
+                            &key,
+                            record,
+                            Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                            "MALFORMED_PAYLOAD",
+                            format!("payload did not match inventory_released shape: {e}"),
+                        )
+                        .await?;
+                        return Ok(HandleOutcome::Poison);
+                    }
+                };
+            // Compensation matrix row 2's second half: the release
+            // confirmation is what finally lets the order become
+            // CANCELLED (spec section 12: "cancel after release
+            // confirmation").
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::Cancelled,
+                Some("inventory release confirmed"),
+                Some(envelope.event_id),
+                None,
+                now,
+                |_, _| Vec::new(),
+            )
+            .await
+            .map(|_| ())
+        }
+        PAYMENT_AUTHORIZED_EVENT_TYPE => {
+            let payload: PaymentAuthorizedPayload =
+                match serde_json::from_value(envelope.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tx.rollback().await?;
+                        publish_dlq(
+                            producer,
+                            source_topic,
+                            &key,
+                            record,
+                            Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                            "MALFORMED_PAYLOAD",
+                            format!("payload did not match payment_authorized shape: {e}"),
+                        )
+                        .await?;
+                        return Ok(HandleOutcome::Poison);
+                    }
+                };
+            // M06 stops here: driving READY_FOR_FULFILMENT is M07's job,
+            // once fulfilment exists to be ready *for*.
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::PaymentAuthorized,
+                Some("payment authorized"),
+                Some(envelope.event_id),
+                None,
+                now,
+                |_, _| Vec::new(),
+            )
+            .await
+            .map(|_| ())
+        }
+        _ => {
+            // PAYMENT_FAILED_EVENT_TYPE: the match above already rejected
+            // anything else as UNSUPPORTED_SCHEMA before reaching here.
+            let payload: PaymentFailedPayload =
+                match serde_json::from_value(envelope.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tx.rollback().await?;
+                        publish_dlq(
+                            producer,
+                            source_topic,
+                            &key,
+                            record,
+                            Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                            "MALFORMED_PAYLOAD",
+                            format!("payload did not match payment_failed shape: {e}"),
+                        )
+                        .await?;
+                        return Ok(HandleOutcome::Poison);
+                    }
+                };
+            let reservation_id: Option<Uuid> =
+                sqlx::query_scalar("select reservation_id from orders where id = $1")
+                    .bind(payload.order_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten();
+            let Some(reservation_id) = reservation_id else {
+                tx.rollback().await?;
+                publish_dlq(
+                    producer,
+                    source_topic,
+                    &key,
+                    record,
+                    Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                    "MISSING_RESERVATION_ID",
+                    format!(
+                        "payment_failed for order {} with no recorded reservation_id",
+                        payload.order_id
+                    ),
+                )
+                .await?;
+                return Ok(HandleOutcome::Poison);
+            };
+            let inventory_command_version =
+                repository::reserve_command_version(&mut tx, payload.order_id, "inventory").await?;
+            let envelope_for_event = envelope.clone();
+            let reason_code = payload.reason_code.clone();
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::Cancelling,
+                Some(payload.reason_code.as_str()),
+                Some(envelope.event_id),
+                None,
+                now,
+                move |order_id, _order_version| {
+                    vec![build_release_inventory_event(
+                        &envelope_for_event,
+                        order_id,
+                        reservation_id,
+                        inventory_command_version,
+                        &reason_code,
+                    )]
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+
+    match outcome_result {
+        Ok(()) => {}
+        Err(TransitionError::IllegalTransition { from, to }) => {
+            log_illegal_transition_race(envelope.aggregate_id, from, to);
+        }
+        Err(e) => return Err(e.into()),
     }
 
     persistence::inbox::advance_version(

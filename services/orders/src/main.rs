@@ -47,11 +47,21 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&publish_metrics),
     );
 
-    let outcome_consumer_handle = spawn_outcome_consumer_loop(
+    let inventory_outcome_consumer_handle = spawn_outcome_consumer_loop(
         pool.clone(),
         Arc::clone(&consumer),
         Arc::clone(&producer),
         Arc::clone(&fault_injector),
+        contracts::inventory::INVENTORY_EVENTS_TOPIC,
+        config.consumer_max_wait_ms,
+        config.consumer_poll_interval_ms,
+    );
+    let payment_outcome_consumer_handle = spawn_outcome_consumer_loop(
+        pool.clone(),
+        Arc::clone(&consumer),
+        Arc::clone(&producer),
+        Arc::clone(&fault_injector),
+        contracts::payments::PAYMENTS_EVENTS_TOPIC,
         config.consumer_max_wait_ms,
         config.consumer_poll_interval_ms,
     );
@@ -74,19 +84,23 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     publisher_handle.abort();
-    outcome_consumer_handle.abort();
+    inventory_outcome_consumer_handle.abort();
+    payment_outcome_consumer_handle.abort();
 
     Ok(())
 }
 
-/// Polls `inventory.events.v1` forever, running the idempotent-inbox
-/// protocol (`orders::outcome_consumer::process_available`) on whatever's
-/// new each tick (spec section 12: react to reservation outcomes, M05).
+/// Polls `source_topic` forever, running the idempotent-inbox protocol
+/// (`orders::outcome_consumer::process_available`) on whatever's new each
+/// tick (spec section 12: react to reservation and payment outcomes). One
+/// loop instance per topic — `main` spawns one for `inventory.events.v1`
+/// and one for `payments.events.v1`.
 fn spawn_outcome_consumer_loop(
     pool: sqlx::PgPool,
     consumer: Arc<dyn messaging::Consumer>,
     producer: Arc<dyn messaging::Producer>,
     fault_injector: Arc<FaultInjector>,
+    source_topic: &'static str,
     max_wait_ms: i32,
     poll_interval_ms: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -97,23 +111,24 @@ fn spawn_outcome_consumer_loop(
                 consumer.as_ref(),
                 producer.as_ref(),
                 &fault_injector,
-                contracts::inventory::INVENTORY_EVENTS_TOPIC,
+                source_topic,
                 max_wait_ms,
             )
             .await;
             match outcome {
                 Ok(summary) if summary.records_seen > 0 => {
                     tracing::info!(
+                        topic = source_topic,
                         applied = summary.applied,
                         duplicate = summary.duplicate,
                         stale = summary.stale,
                         poison = summary.poison,
-                        "processed reservation-outcome batch"
+                        "processed outcome batch"
                     );
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::error!(error = %err, "reservation-outcome consumer batch failed")
+                    tracing::error!(topic = source_topic, error = %err, "outcome consumer batch failed")
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
