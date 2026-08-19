@@ -9,7 +9,7 @@
 - [x] M04 — Inventory consumer and idempotent inbox
 - [x] M05 — Payments with retry taxonomy
 - [x] M06 — Choreographed workflow and compensation
-- [ ] M07 — Fulfilment and complete compensation matrix
+- [x] M07 — Fulfilment and complete compensation matrix
 - [ ] M08 — Ordering, replay, and concurrency hardening
 - [ ] M09 — Observability, chaos, and operations
 - [ ] M10 — Final acceptance, README, and learning write-up
@@ -17,8 +17,7 @@
 
 ## Current milestone
 
-M06 complete. Next action: M07 — fulfilment and complete compensation
-matrix.
+M07 complete. Next action: M08 — ordering, replay, and concurrency hardening.
 
 ## Decisions
 
@@ -343,26 +342,18 @@ existing tests). Total inventory-service tests: 14 passed, 0 failed (12
 from M04 + 2 new release tests). Workspace-wide test count now over 100
 across all crates/services.
 
+## M07 completion
+
+Fulfilment now consumes explicit readiness commands through an idempotent
+inbox and emits created/failed outcomes through its transactional outbox.
+Orders records reservation/payment facts, emits fulfilment exactly once,
+reaches `COMPLETED` on success, and runs refund plus inventory release on
+failure. It reaches `CANCELLED` only after both acknowledgements, or
+`MANUAL_REVIEW` with a DLQ/operator signal when compensation is exhausted.
+
+Acceptance evidence, including two real four-service flows, is recorded in
+`docs/evidence/m07.md`.
+
 ## Next action
 
-Start M07: fulfilment and complete compensation matrix. Per the scope
-boundary above, M07 must:
-
-1. Build the fulfilment service (migrations, `fulfilments` table,
-   readiness command/event flow) — currently only a health-only skeleton
-   from M00.
-2. Extend orders' outcome consumer to derive fulfilment readiness from the
-   independent reservation/payment facts it already tracks (spec section
-   12: "store independent facts... and derive readiness") and emit
-   `fulfilment.create_fulfilment` once both are true.
-3. Drive `PAYMENT_AUTHORIZED`→`READY_FOR_FULFILMENT`→`COMPLETED` on
-   fulfilment success.
-4. Implement compensation matrix row 3 (fulfilment failure → refund
-   payment **and** release inventory, cancel only after **both**
-   confirmations) — this needs tracking which compensations are
-   pending/confirmed, since M06 only ever has one compensation in flight
-   at a time (release only).
-5. Implement row 4: compensation retry budget exhausted →
-   `MANUAL_REVIEW` with a DLQ/operator signal.
-6. Terminal-exclusivity and full-invariant tests under duplicates, per
-   M07's acceptance gates.
+Start M08: ordering, replay, and concurrency hardening.
