@@ -1,0 +1,14 @@
+groups:
+  - name: order-system
+    rules:
+      - alert: OldOutboxRows
+        expr: outbox_oldest_unpublished_age_seconds > 60
+        for: 2m
+      - alert: ConsumerLagGrowing
+        expr: consumer_lag_records > 100
+        for: 2m
+      - alert: DeadLettersPublished
+        expr: increase(dlq_published_total[5m]) > 0
+      - alert: CompensationStuck
+        expr: compensation_oldest_age_seconds > 600
+        for: 2m
