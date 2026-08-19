@@ -26,6 +26,13 @@ pub struct Config {
     pub outbox_poll_interval_ms: u64,
     pub outbox_backoff_base_ms: u64,
     pub outbox_backoff_cap_ms: u64,
+    /// How long the reservation-outcome consumer's fetch may block waiting
+    /// for new records before returning an empty batch (rskafka's
+    /// `max_wait_ms`).
+    pub consumer_max_wait_ms: i32,
+    /// How long to sleep between consumer polls when a fetch comes back
+    /// empty.
+    pub consumer_poll_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -39,6 +46,8 @@ impl Default for Config {
             outbox_poll_interval_ms: 200,
             outbox_backoff_base_ms: 100,
             outbox_backoff_cap_ms: 30_000,
+            consumer_max_wait_ms: 1_000,
+            consumer_poll_interval_ms: 200,
         }
     }
 }

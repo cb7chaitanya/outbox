@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use messaging::RskafkaProducer;
+use messaging::{RskafkaConsumer, RskafkaProducer};
 use orders::config::{Config, DatabaseConfig, FailureInjectionConfig, MessagingConfig};
 use orders::http::{self, AppState};
 use persistence::outbox::PublishMetrics;
@@ -24,6 +24,8 @@ async fn main() -> anyhow::Result<()> {
 
     let producer: Arc<dyn messaging::Producer> =
         Arc::new(RskafkaProducer::connect(vec![messaging_config.redpanda_broker.clone()]).await?);
+    let consumer: Arc<dyn messaging::Consumer> =
+        Arc::new(RskafkaConsumer::connect(vec![messaging_config.redpanda_broker.clone()]).await?);
 
     if failure_injection_config.enabled() {
         tracing::warn!("FAILURE_INJECTION_ENABLED=true: /_test/faults/* is mounted");
@@ -45,6 +47,15 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&publish_metrics),
     );
 
+    let outcome_consumer_handle = spawn_outcome_consumer_loop(
+        pool.clone(),
+        Arc::clone(&consumer),
+        Arc::clone(&producer),
+        Arc::clone(&fault_injector),
+        config.consumer_max_wait_ms,
+        config.consumer_poll_interval_ms,
+    );
+
     let state = AppState {
         pool,
         producer,
@@ -63,8 +74,51 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     publisher_handle.abort();
+    outcome_consumer_handle.abort();
 
     Ok(())
+}
+
+/// Polls `inventory.events.v1` forever, running the idempotent-inbox
+/// protocol (`orders::outcome_consumer::process_available`) on whatever's
+/// new each tick (spec section 12: react to reservation outcomes, M05).
+fn spawn_outcome_consumer_loop(
+    pool: sqlx::PgPool,
+    consumer: Arc<dyn messaging::Consumer>,
+    producer: Arc<dyn messaging::Producer>,
+    fault_injector: Arc<FaultInjector>,
+    max_wait_ms: i32,
+    poll_interval_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let outcome = orders::outcome_consumer::process_available(
+                &pool,
+                consumer.as_ref(),
+                producer.as_ref(),
+                &fault_injector,
+                contracts::inventory::INVENTORY_EVENTS_TOPIC,
+                max_wait_ms,
+            )
+            .await;
+            match outcome {
+                Ok(summary) if summary.records_seen > 0 => {
+                    tracing::info!(
+                        applied = summary.applied,
+                        duplicate = summary.duplicate,
+                        stale = summary.stale,
+                        poison = summary.poison,
+                        "processed reservation-outcome batch"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!(error = %err, "reservation-outcome consumer batch failed")
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+        }
+    })
 }
 
 async fn shutdown_signal() {
