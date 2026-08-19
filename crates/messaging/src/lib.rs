@@ -24,10 +24,18 @@ pub enum MessagingError {
 }
 
 /// Publishes a single envelope to a topic, keyed for partition ordering.
+/// `headers` carries the `event_id`, correlation/causation, and producer
+/// name headers required by spec section 13 point 3; callers that don't
+/// need them (e.g. the naive path) may pass an empty vec.
 #[async_trait::async_trait]
 pub trait Producer: Send + Sync {
-    async fn publish(&self, topic: &str, key: &str, payload: Vec<u8>)
-    -> Result<(), MessagingError>;
+    async fn publish(
+        &self,
+        topic: &str,
+        key: &str,
+        payload: Vec<u8>,
+        headers: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), MessagingError>;
 }
 
 /// Minimal rskafka-backed [`Producer`]. Every topic this project uses (spec
@@ -76,6 +84,7 @@ impl Producer for NoopProducer {
         _topic: &str,
         _key: &str,
         _payload: Vec<u8>,
+        _headers: Vec<(String, Vec<u8>)>,
     ) -> Result<(), MessagingError> {
         Ok(())
     }
@@ -88,12 +97,13 @@ impl Producer for RskafkaProducer {
         topic: &str,
         key: &str,
         payload: Vec<u8>,
+        headers: Vec<(String, Vec<u8>)>,
     ) -> Result<(), MessagingError> {
         let partition_client = self.partition_client(topic).await?;
         let record = Record {
             key: Some(key.as_bytes().to_vec()),
             value: Some(payload),
-            headers: Default::default(),
+            headers: headers.into_iter().collect(),
             timestamp: Utc::now(),
         };
         partition_client
@@ -119,7 +129,7 @@ mod live_tests {
             .await
             .expect("connect to redpanda");
         producer
-            .publish("orders.events.v1", "smoke-test-key", b"hello".to_vec())
+            .publish("orders.events.v1", "smoke-test-key", b"hello".to_vec(), vec![])
             .await
             .expect("publish succeeds");
     }

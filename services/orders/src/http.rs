@@ -220,6 +220,30 @@ async fn create_order(
     Ok(response)
 }
 
+/// Kafka message headers carrying `event_id` and correlation/causation IDs
+/// (spec section 13 point 3), independent of the delivery mode.
+fn event_headers(
+    event_id: &Uuid,
+    correlation_id: Uuid,
+    causation_id: Uuid,
+) -> Vec<(String, Vec<u8>)> {
+    vec![
+        ("event_id".to_string(), event_id.to_string().into_bytes()),
+        (
+            "correlation_id".to_string(),
+            correlation_id.to_string().into_bytes(),
+        ),
+        (
+            "causation_id".to_string(),
+            causation_id.to_string().into_bytes(),
+        ),
+        (
+            "producer".to_string(),
+            ORDERS_PRODUCER_NAME.to_string().into_bytes(),
+        ),
+    ]
+}
+
 /// The naive dual-write path (spec section 11): after the order row is
 /// committed, publish `orders.order_created` directly to Kafka and return
 /// `202` only if both steps succeed. Deliberately republishes on every
@@ -274,10 +298,11 @@ async fn publish_naive(
         payload,
     };
     let bytes = serde_json::to_vec(&envelope).expect("envelope serialization cannot fail");
+    let headers = event_headers(&envelope.event_id, envelope.correlation_id, envelope.causation_id);
 
     state
         .producer
-        .publish(ORDER_CREATED_TOPIC, &subject, bytes)
+        .publish(ORDER_CREATED_TOPIC, &subject, bytes, headers)
         .await
         .map_err(|e| ApiError::PublishFailed(e.to_string()))?;
 
