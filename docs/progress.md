@@ -6,7 +6,7 @@
 - [x] M01 — Orders API and local consistency
 - [x] M02 — Naive dual write and failure lab
 - [x] M03 — Transactional outbox
-- [ ] M04 — Inventory consumer and idempotent inbox
+- [x] M04 — Inventory consumer and idempotent inbox
 - [ ] M05 — Payments with retry taxonomy
 - [ ] M06 — Choreographed workflow and compensation
 - [ ] M07 — Fulfilment and complete compensation matrix
@@ -17,7 +17,7 @@
 
 ## Current milestone
 
-M03 complete. Next action: M04 — inventory consumer and idempotent inbox.
+M04 complete. Next action: M05 — payments with retry taxonomy.
 
 ## Decisions
 
@@ -93,6 +93,38 @@ M03 complete. Next action: M04 — inventory consumer and idempotent inbox.
   `delivery_mode` (a no-op poll loop when the table is empty in naive
   mode), so toggling `DELIVERY_MODE` back to `outbox` never needs a
   restart-time wiring change.
+- M04 judgment call: orders now emits `inventory.reserve_inventory`
+  explicitly (on `inventory.commands.v1`, same outbox transaction as
+  `order_created`) rather than having inventory consume `order_created`
+  directly as an implicit trigger — the real command contract from
+  section 8, not a placeholder M06 would have to replace. See
+  `docs/adr/0007-orders-emits-reserve-inventory-command.md`.
+- `rskafka` has no consumer-group/offset-commit protocol (ADR 0001's
+  build-toolchain constraint applies here too). Consumers track their own
+  read position in a `consumer_offsets` table per service, advanced only
+  after the corresponding business transaction (or DLQ publish) commits —
+  the same "never ack before durable" guarantee the spec asks for, just
+  implemented locally instead of via a broker API. See
+  `docs/adr/0006-inbox-consumer-offset-ledger.md`.
+- M04 scope boundary: an out-of-order aggregate version (`Gap` in
+  `persistence::inbox::version_decision`) goes straight to DLQ with
+  `EXPECTED_VERSION_GAP` — no bounded retry/buffer window yet. That
+  window is M08's ("Ordering, replay, and concurrency hardening")
+  deliverable by name. See `docs/adr/0008-m04-gap-policy-scope-boundary.md`.
+  **M08 must add:** the bounded retry/buffer step before this DLQ branch,
+  plus a test proving a recoverable gap no longer immediately DLQs.
+- Reusable inbox primitives (`persistence::inbox`: `try_claim`, `fetch`,
+  `mark_processed`, `version_decision`, `advance_version`,
+  `fetch_offset`/`commit_offset`) and the DLQ record shape/publish helper
+  (`persistence::dlq`) are generic across every future consumer, matching
+  how `persistence::outbox` was already reusable when inventory needed
+  its own outbox in this same milestone (no changes to `outbox.rs` were
+  needed — it was never orders-coupled).
+- Inventory's `repository::reserve` takes an already-open transaction
+  connection rather than owning its own transaction (unlike orders'
+  `create_order`), because the consumer handler must apply it, insert the
+  resulting outbox event, advance the consumer-version row, and mark the
+  inbox row processed all in one transaction (spec section 14 steps 4-7).
 
 ## Commands run and results (M00)
 
@@ -173,18 +205,43 @@ Total orders-service tests: 34 passed, 0 failed (26 from M01+M02
 unchanged + 6 new outbox acceptance demonstrations, plus 3 new
 `full_jitter_backoff` unit tests in `persistence`).
 
+## Commands run and results (M04)
+
+All commands below were actually run in this repository state on
+2026-08-19, against the M00-M03 infrastructure (still running). Full
+transcript excerpts, including all five M04 acceptance-gate proofs and a
+live end-to-end order → reservation check, are in `docs/evidence/m04.md`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 warnings |
+| `cargo build --workspace` | success |
+| `cargo test -p inventory --lib` | 5/5 |
+| `cargo test -p inventory --test consumer_tests` | 5/5, all five M04 acceptance gates |
+| same, repeated 3x | 5/5 every run, no flakes |
+| `cargo test --workspace --tests` (full suite) | all green across every crate/service |
+| live: `cargo run -p orders` + `cargo run -p inventory`, seed stock, `POST /v1/orders`, poll stock | `available_qty` 50→45, `reserved_qty` 0→5 within 3s; `reservation_succeeded` observed on `inventory.events.v1` with correct correlation/causation |
+
+Total inventory-service tests: 10 passed, 0 failed (5 unit + 5
+integration). Workspace-wide test count now in the 70s across all
+crates/services.
+
 ## Next action
 
-Start M04: inventory consumer and idempotent inbox. Add the
-`inbox_events`/`consumer_aggregate_versions` tables and claim/dedupe
-primitives to `persistence` (spec section 9, section 14), build the
-inventory service's stock/reservation schema and multi-SKU
-sorted-lock-order reservation transaction (spec section 9 "Inventory"),
-consume `orders.order_created` from `orders.events.v1` with the
-inbox-transaction discipline (validate → insert inbox row with `ON
-CONFLICT DO NOTHING` → check hash on duplicate → apply mutation →
-insert outbox events → mark processed → commit DB → commit Kafka offset
-only after), and reuse this milestone's outbox publisher/backoff code
-for inventory's own outbox rather than duplicating it. Do not disable
-Kafka auto-commit assumptions loosely — offset commit must happen only
-after the local transaction commits.
+Start M05: payments with retry taxonomy. Implement the fake payment
+provider (deterministic, in-process — no real network dependency),
+`payments` service migrations (`payments`, `payment_operations` per spec
+section 9), authorization/refund handlers wired the same way inventory's
+consumer is (idempotent inbox, its own outbox), the full error-
+classification table from section 15 (transient/contention/rate-limited/
+permanent/poison) driving actual retry behavior — this is the milestone
+that owns that taxonomy, deferred by ADR 0005 and ADR 0008's scope notes
+— full-jitter backoff with retry budgets, and deterministic fault tests
+(timeout-then-success, lost-success-response-then-retry, decline,
+poison-input, idempotent refund). Payments only begins authorization
+after `reservation_succeeded` — since M05 lands before M06's full
+choreography wiring, follow M04's precedent (ADR 0007): decide whether
+orders emits an explicit `payments.authorize_payment` command now (mirroring
+how it now emits `reserve_inventory`) or whether that wiring waits for
+M06, and document the choice in an ADR rather than leaving it implicit.

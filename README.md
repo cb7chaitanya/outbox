@@ -8,21 +8,32 @@ optional saga orchestrator — until the same failures are handled
 correctly. See `PROJECT_2_SPEC.md` for the full contract this repository
 implements, milestone by milestone.
 
-## What's built so far (M00-M03)
+## What's built so far (M00-M04)
 
 Workspace scaffolding (M00), the orders service's local-consistency core
 (M01: idempotent order creation, versioned state machine, transition
-history), the naive dual-write stage plus its failure lab (M02), and the
-transactional outbox that replaces it as the default (M03): `orders` now
-inserts a business mutation and its outbox event in one database
-transaction, and a background publisher worker claims rows with
-`FOR UPDATE SKIP LOCKED` leases and publishes them independently of the
-request path, retrying with full-jitter backoff on failure. The naive
-publish path from M02 stays runnable behind `DELIVERY_MODE=naive` so its
-failure lab remains reproducible; `DELIVERY_MODE=outbox` is now the
-default and closes the lost-event window the naive path has. Inventory,
-payments, and fulfilment remain health-endpoint skeletons (M04+). Track
-progress in [`docs/progress.md`](docs/progress.md).
+history), the naive dual-write stage plus its failure lab (M02), the
+transactional outbox that replaces it as the default (M03), and the
+inventory service's idempotent reservation consumer (M04): `orders` now
+inserts a business mutation and its outbox event(s) in one database
+transaction — since M04, that includes an explicit
+`inventory.reserve_inventory` command alongside `order_created` (see
+`docs/adr/0007-orders-emits-reserve-inventory-command.md`) — and a
+background publisher worker claims rows with `FOR UPDATE SKIP LOCKED`
+leases and publishes them independently of the request path, retrying
+with full-jitter backoff on failure. `inventory` consumes that command
+through the idempotent-inbox protocol (spec section 14): dedupe by
+`(consumer, event_id)`, verify a duplicate's payload hash, decide
+apply/stale/gap by aggregate version, reserve stock all-or-nothing with
+sorted-order row locking (never oversells, never partially reserves a
+multi-SKU request), reply with `reservation_succeeded`/`reservation_failed`
+through its own outbox, and dead-letter anything it can't process
+(malformed envelope, unsupported schema, out-of-order gap) without
+blocking the rest of the partition. The naive publish path from M02 stays
+runnable behind `DELIVERY_MODE=naive` so its failure lab remains
+reproducible; `DELIVERY_MODE=outbox` is the default. Payments and
+fulfilment remain health-endpoint skeletons (M05+). Track progress in
+[`docs/progress.md`](docs/progress.md).
 
 ## Architecture
 
@@ -91,9 +102,20 @@ curl http://localhost:8081/health/live
 curl http://localhost:8081/health/ready
 ```
 
-`orders` checks a real Postgres connection (bounded 2s timeout) for
-`/health/ready`; the other three services still return `200 ok`
-unconditionally until their own persistence lands.
+`orders` and `inventory` check a real Postgres connection (bounded 2s
+timeout) for `/health/ready`; `payments` and `fulfilment` still return
+`200 ok` unconditionally until their own persistence lands (M05+).
+
+### Inventory dev endpoints
+
+`inventory` exposes dev/test-only stock seed/read endpoints (spec
+section 6):
+
+```sh
+curl -X PUT http://localhost:8082/_dev/stock/SKU-1 \
+  -H "Content-Type: application/json" -d '{"available_qty": 50}'
+curl http://localhost:8082/_dev/stock/SKU-1
+```
 
 ### Orders API example
 
@@ -177,9 +199,31 @@ crash-then-duplicate-then-published, two publishers sharing a backlog
 without double-publishing, broker-outage backlog growth and drain, and
 the closed lost-event window): `services/orders/tests/outbox_tests.rs`.
 Backlog/publish/lease-recovery counters: `GET /metrics` on the orders
-service. This section grows as later milestones (inventory/payments/
-fulfilment consumers, M04+) land; see `docs/progress.md` for current
-status.
+service.
+
+**Idempotent inventory consumer (M04):** `orders`' outbox now carries a
+second event alongside `order_created` — an explicit
+`inventory.reserve_inventory` command, in the same transaction — which
+`inventory` consumes through the eight-step protocol in spec section 14:
+validate the envelope, claim `(consumer, event_id)` in its own inbox
+table (a duplicate delivery is a safe no-op, verified by comparing the
+stored payload hash), classify the aggregate version as apply/stale/gap,
+reserve stock all-or-nothing with SKU-sorted row locking (never oversells
+under concurrency, never partially reserves a multi-SKU request), publish
+`reservation_succeeded`/`reservation_failed` through its own transactional
+outbox, and only then advance its local offset ledger — never before the
+business transaction (or a DLQ publish, for a message it can't process)
+has already committed. `rskafka` has no consumer-group/offset-commit
+protocol, so "commit the offset" here means a row in `inventory`'s own
+`consumer_offsets` table rather than a broker API call; see
+`docs/adr/0006-inbox-consumer-offset-ledger.md`. Malformed envelopes,
+unsupported schema versions, and unresolved version gaps are dead-lettered
+to `inventory.commands.v1.dlq` without blocking other messages on the
+partition (invariant I15). Deterministic, automated demonstrations of all
+five M04 acceptance gates: `services/inventory/tests/consumer_tests.rs`.
+
+This section grows as later milestones (payments/fulfilment consumers,
+choreography, M05+) land; see `docs/progress.md` for current status.
 
 ## Delivery semantics
 
@@ -192,7 +236,7 @@ claim of end-to-end exactly-once delivery. See spec section 5.
 make fmt              # cargo fmt --all
 make lint              # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test-unit          # cargo test --workspace --lib --bins
-make test-integration    # real Postgres integration tests (orders repository + HTTP layer)
+make test-integration    # real Postgres/Redpanda integration tests (orders + inventory)
 make test-e2e             # not yet implemented (M06/M07)
 make test                  # fmt + lint + test-unit + test-integration
 make demo-naive-failure     # runs both dual-write failure demonstrations live (M02)
@@ -241,12 +285,22 @@ When enabled, `orders` mounts `PUT /_test/faults/{name}` and
 
 ## Known limitations
 
-- M00-M03 only: `orders` has a transactional outbox and a publisher
-  worker, but nothing else consumes `orders.order_created` yet — no
-  inbox/idempotent-consumer pattern exists until M04.
-  Inventory/payments/fulfilment remain health-endpoint skeletons with no
-  persistence wiring, so their `/health/ready` doesn't check a dependency
-  yet (orders' does).
+- M00-M04 only: `orders` and `inventory` are wired end-to-end (order
+  creation → `reserve_inventory` command → reservation →
+  `reservation_succeeded`/`reservation_failed`), but nothing yet reacts to
+  inventory's outcome events — orders does not update its own status from
+  them until M06's choreography lands (spec section 12's transition graph
+  is encoded but only `PENDING` is reachable end-to-end so far). Payments
+  and fulfilment remain health-endpoint skeletons with no persistence
+  wiring, so their `/health/ready` doesn't check a dependency yet.
+- An out-of-order aggregate version at the inventory consumer goes
+  straight to DLQ (`EXPECTED_VERSION_GAP`) rather than through the bounded
+  retry/buffer window spec section 14 describes — that window is M08's
+  deliverable by name; see `docs/adr/0008-m04-gap-policy-scope-boundary.md`.
+- The inventory consumer is not yet safe to run as multiple concurrent
+  replicas against the same topic/partition (no consumer-group-style
+  partition assignment) — see `docs/adr/0006-inbox-consumer-offset-ledger.md`'s
+  consequences section.
 - The naive publish path (still runnable behind `DELIVERY_MODE=naive`)
   republishes on every accepted create call, including idempotent
   replays — a deliberate, documented anti-pattern
