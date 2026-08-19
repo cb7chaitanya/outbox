@@ -391,3 +391,95 @@ async fn refund_is_idempotent(pool: PgPool) {
     // which is what makes the provider-ledger side of this idempotent too.
     let _ = refund_idempotency_key(order_id);
 }
+
+/// A recoverable version gap within one fetched broker window is buffered
+/// by reordering that aggregate's commands, while the contiguous offset
+/// tracker prevents acknowledging past the original lower offset early.
+#[sqlx::test(migrations = "./migrations")]
+async fn recoverable_gap_applies_in_version_order(pool: PgPool) {
+    let _topic_guard = common::topic_lock().await;
+    let producer = common::connect_producer().await;
+    let consumer = common::connect_consumer().await;
+    common::seed_offset_to_latest(&pool, &consumer, PAYMENTS_COMMANDS_TOPIC).await;
+    let fault_injector = Arc::new(FaultInjector::new());
+    let provider = common::fake_provider(Arc::clone(&fault_injector));
+    let order_id = Uuid::now_v7();
+    let payment_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+
+    let (_, refund) = common::build_refund_envelope(order_id, payment_id, 2, correlation_id);
+    let (_, authorize) =
+        common::build_authorize_envelope(order_id, payment_id, 3000, "USD", 1, correlation_id);
+    common::publish_raw(
+        &producer,
+        PAYMENTS_COMMANDS_TOPIC,
+        &order_id.to_string(),
+        refund,
+    )
+    .await;
+    common::publish_raw(
+        &producer,
+        PAYMENTS_COMMANDS_TOPIC,
+        &order_id.to_string(),
+        authorize,
+    )
+    .await;
+
+    let summary = common::drain(
+        &pool,
+        &consumer,
+        &producer,
+        &provider,
+        &fault_injector,
+        PAYMENTS_COMMANDS_TOPIC,
+        &common::fast_retry_config(),
+    )
+    .await;
+    assert_eq!(summary.applied, 2);
+    assert_eq!(summary.poison, 0);
+    assert_eq!(provider.real_authorize_calls(), 1);
+    assert_eq!(provider.real_refund_calls(), 1);
+    let status: String =
+        sqlx::query_scalar("select status::text from payments where order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "REFUNDED");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stale_command_is_counted_and_has_no_second_effect(pool: PgPool) {
+    let _topic_guard = common::topic_lock().await;
+    let producer = common::connect_producer().await;
+    let consumer = common::connect_consumer().await;
+    common::seed_offset_to_latest(&pool, &consumer, PAYMENTS_COMMANDS_TOPIC).await;
+    let faults = Arc::new(FaultInjector::new());
+    let provider = common::fake_provider(Arc::clone(&faults));
+    let order_id = Uuid::now_v7();
+    let payment_id = Uuid::now_v7();
+    for _ in 0..2 {
+        let (_, bytes) =
+            common::build_authorize_envelope(order_id, payment_id, 1000, "USD", 1, Uuid::now_v7());
+        common::publish_raw(
+            &producer,
+            PAYMENTS_COMMANDS_TOPIC,
+            &order_id.to_string(),
+            bytes,
+        )
+        .await;
+    }
+    let summary = common::drain(
+        &pool,
+        &consumer,
+        &producer,
+        &provider,
+        &faults,
+        PAYMENTS_COMMANDS_TOPIC,
+        &common::fast_retry_config(),
+    )
+    .await;
+    assert_eq!(summary.applied, 1);
+    assert_eq!(summary.stale, 1);
+    assert_eq!(provider.real_authorize_calls(), 1);
+}
