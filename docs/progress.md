@@ -11,13 +11,13 @@
 - [x] M06 — Choreographed workflow and compensation
 - [x] M07 — Fulfilment and complete compensation matrix
 - [x] M08 — Ordering, replay, and concurrency hardening
-- [ ] M09 — Observability, chaos, and operations
+- [x] M09 — Observability, chaos, and operations
 - [ ] M10 — Final acceptance, README, and learning write-up
 - [ ] M11 — Optional saga orchestrator (only after M10)
 
 ## Current milestone
 
-M08 complete. Next action: M09 — observability, chaos, and operations.
+M09 complete. Next action: M10 — final acceptance and learning guide.
 
 ## Decisions
 
@@ -356,5 +356,5 @@ Acceptance evidence, including two real four-service flows, is recorded in
 
 ## Next action
 
-Start M09: observability, chaos, and operations. M08 evidence is recorded in
-`docs/evidence/m08.md`.
+Start M10: final acceptance, README, and learning write-up. M09 evidence is
+recorded in `docs/evidence/m09.md`.
