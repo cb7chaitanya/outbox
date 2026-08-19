@@ -63,6 +63,61 @@ services:
       redpanda:
         condition: service_healthy
 
+  migrate:
+    build:
+      context: .
+      args: { PACKAGE: migrate-all }
+    environment:
+      ORDERS_DATABASE_URL: postgres://${POSTGRES_USER:-outbox_dev}:${POSTGRES_PASSWORD:-outbox_dev_password}@postgres:5432/${POSTGRES_ORDERS_DB:-orders}
+      INVENTORY_DATABASE_URL: postgres://${POSTGRES_USER:-outbox_dev}:${POSTGRES_PASSWORD:-outbox_dev_password}@postgres:5432/${POSTGRES_INVENTORY_DB:-inventory}
+      PAYMENTS_DATABASE_URL: postgres://${POSTGRES_USER:-outbox_dev}:${POSTGRES_PASSWORD:-outbox_dev_password}@postgres:5432/${POSTGRES_PAYMENTS_DB:-payments}
+      FULFILMENT_DATABASE_URL: postgres://${POSTGRES_USER:-outbox_dev}:${POSTGRES_PASSWORD:-outbox_dev_password}@postgres:5432/${POSTGRES_FULFILMENT_DB:-fulfilment}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  orders:
+    build: { context: ., args: { PACKAGE: orders } }
+    env_file: .env
+    environment: &service_environment
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDPANDA_BROKER: redpanda:9092
+    ports: ["${ORDERS_PORT:-8081}:8081"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redpanda: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-fsS", "http://localhost:8081/health/ready"], interval: 5s, timeout: 3s, retries: 20 }
+
+  inventory:
+    build: { context: ., args: { PACKAGE: inventory } }
+    env_file: .env
+    environment: *service_environment
+    ports: ["${INVENTORY_PORT:-8082}:8082"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redpanda: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-fsS", "http://localhost:8082/health/ready"], interval: 5s, timeout: 3s, retries: 20 }
+
+  payments:
+    build: { context: ., args: { PACKAGE: payments } }
+    env_file: .env
+    environment: *service_environment
+    ports: ["${PAYMENTS_PORT:-8083}:8083"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redpanda: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-fsS", "http://localhost:8083/health/ready"], interval: 5s, timeout: 3s, retries: 20 }
+
+  fulfilment:
+    build: { context: ., args: { PACKAGE: fulfilment } }
+    env_file: .env
+    environment: *service_environment
+    ports: ["${FULFILMENT_PORT:-8084}:8084"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redpanda: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-fsS", "http://localhost:8084/health/ready"], interval: 5s, timeout: 3s, retries: 20 }
+
   prometheus:
     image: prom/prometheus:v2.55.1
     profiles: ["observability"]

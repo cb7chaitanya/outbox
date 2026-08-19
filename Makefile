@@ -24,12 +24,17 @@ setup:
 
 ## Bring up infrastructure and wait for readiness.
 up:
-	docker compose up -d
+	docker compose up -d postgres redpanda redpanda-console
 	@echo "waiting for postgres and redpanda healthchecks..."
 	@until [ "$$(docker compose ps -q postgres | xargs docker inspect -f '{{.State.Health.Status}}')" = "healthy" ]; do sleep 1; done
 	@until [ "$$(docker compose ps -q redpanda | xargs docker inspect -f '{{.State.Health.Status}}')" = "healthy" ]; do sleep 1; done
 	docker compose exec -T redpanda rpk cluster config set auto_create_topics_enabled false
-	@echo "infrastructure healthy"
+	$(MAKE) topics
+	docker compose up -d --build orders inventory payments fulfilment
+	@for service in orders inventory payments fulfilment; do \
+		until [ "$$(docker compose ps -q $$service | xargs docker inspect -f '{{.State.Health.Status}}')" = "healthy" ]; do sleep 1; done; \
+	done
+	@echo "infrastructure and services healthy"
 
 ## Stop services without deleting data.
 down:
@@ -42,7 +47,7 @@ reset:
 
 ## Apply database migrations for every service.
 migrate:
-	@echo "migrate: not yet implemented (lands with M01 orders migrations)"
+	docker compose run --rm migrate
 
 ## Explicitly create the Kafka-compatible topics used by the workflow.
 topics:
@@ -71,7 +76,9 @@ test-integration:
 	cargo test --workspace --tests
 
 test-e2e:
-	@echo "test-e2e: not yet implemented (lands with M06/M07 choreographed workflow)"
+	@set -a && . ./.env && set +a && \
+	DATABASE_URL="postgres://$$POSTGRES_USER:$$POSTGRES_PASSWORD@$$POSTGRES_HOST:$$POSTGRES_PORT/$$POSTGRES_ORDERS_DB" \
+	cargo test -p orders --test choreography_tests
 
 ## Full required suite: format check, lint, and everything currently implemented.
 test: fmt lint test-unit test-integration

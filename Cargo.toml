@@ -12,6 +12,7 @@ members = [
   "services/payments",
   "services/fulfilment",
   "tools/replay-dlq",
+  "tools/migrate-all",
 ]
 
 [workspace.package]
