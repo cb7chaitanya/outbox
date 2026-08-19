@@ -37,6 +37,12 @@ pub struct OrderRow {
     /// compensation matrix: needed to build `release_inventory` on a later
     /// payment failure, without a cross-service join).
     pub reservation_id: Option<Uuid>,
+    pub payment_id: Option<Uuid>,
+    pub fulfilment_id: Option<Uuid>,
+    pub compensation_release_required: bool,
+    pub compensation_release_done: bool,
+    pub compensation_refund_required: bool,
+    pub compensation_refund_done: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -62,6 +68,8 @@ pub struct TransitionRow {
 
 const ORDER_COLUMNS: &str = "id, idempotency_key, idempotency_request_hash, status, \
      currency, amount_minor, version, cancellation_reason, correlation_id, reservation_id, \
+     payment_id, fulfilment_id, compensation_release_required, compensation_release_done, \
+     compensation_refund_required, compensation_refund_done, \
      created_at, updated_at";
 
 #[derive(Debug, thiserror::Error)]
