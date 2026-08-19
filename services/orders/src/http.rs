@@ -14,6 +14,7 @@ use contracts::orders::{
     OrderCreatedPayload,
 };
 use messaging::Producer;
+use persistence::outbox::NewOutboxEvent;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use test_support::{FaultConfig, FaultInjector};
@@ -188,12 +189,56 @@ async fn create_order(
     let correlation_id = extract_or_generate_correlation_id(&headers);
     let normalized = validate_and_normalize(body)?;
 
+    // Built once, up front, so the outbox row's event id stays stable even
+    // if a caller-level retry re-invokes this handler (spec section 13).
+    // Only used when `delivery_mode == Outbox`; the closure checks that
+    // itself so `create_order` doesn't need to know about delivery modes.
+    let event_id = Uuid::now_v7();
+    let causation_id = Uuid::now_v7();
+    let delivery_mode = state.delivery_mode;
+    let event_items: Vec<OrderCreatedItem> = normalized
+        .items
+        .iter()
+        .map(|item| OrderCreatedItem {
+            sku: item.sku.clone(),
+            quantity: item.quantity,
+        })
+        .collect();
+    let event_currency = normalized.currency.clone();
+    let event_amount_minor = normalized.amount_minor;
+
     let outcome = repository::create_order(
         &state.pool,
         &idempotency_key,
         &normalized,
         correlation_id,
         Utc::now(),
+        move |order_id, order_version| {
+            if delivery_mode != DeliveryMode::Outbox {
+                return None;
+            }
+            let envelope = build_order_created_envelope(
+                event_id,
+                order_id,
+                order_version,
+                event_items,
+                event_currency,
+                event_amount_minor,
+                correlation_id,
+                causation_id,
+            );
+            let envelope_json =
+                serde_json::to_value(&envelope).expect("envelope serializes to json");
+            Some(NewOutboxEvent {
+                id: event_id,
+                aggregate_type: ORDER_AGGREGATE_TYPE.to_string(),
+                aggregate_id: order_id,
+                aggregate_version: order_version,
+                topic: ORDER_CREATED_TOPIC.to_string(),
+                message_key: order_id.to_string(),
+                envelope: envelope_json,
+            })
+        },
     )
     .await?;
 
@@ -244,6 +289,44 @@ fn event_headers(
     ]
 }
 
+/// Builds an `orders.order_created` envelope. Shared by the naive publish
+/// path (which has an already-committed `CreateOutcome` to read fields
+/// from) and the outbox event builder (which only has the order id and
+/// version the repository just assigned, plus the pre-validated request).
+#[allow(clippy::too_many_arguments)]
+fn build_order_created_envelope(
+    event_id: Uuid,
+    order_id: Uuid,
+    order_version: i64,
+    items: Vec<OrderCreatedItem>,
+    currency: String,
+    amount_minor: i64,
+    correlation_id: Uuid,
+    causation_id: Uuid,
+) -> Envelope<OrderCreatedPayload> {
+    Envelope {
+        event_id,
+        event_type: ORDER_CREATED_EVENT_TYPE.to_string(),
+        schema_version: ORDER_CREATED_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: ORDERS_PRODUCER_NAME.to_string(),
+        aggregate_type: ORDER_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: order_version,
+        correlation_id,
+        causation_id,
+        traceparent: None,
+        payload: OrderCreatedPayload {
+            order_id,
+            items,
+            amount: OrderCreatedAmount {
+                currency,
+                minor_units: amount_minor,
+            },
+        },
+    }
+}
+
 /// The naive dual-write path (spec section 11): after the order row is
 /// committed, publish `orders.order_created` directly to Kafka and return
 /// `202` only if both steps succeed. Deliberately republishes on every
@@ -268,37 +351,30 @@ async fn publish_naive(
             .map_err(|f| ApiError::InjectedFault(f.name))?;
     }
 
-    let payload = OrderCreatedPayload {
+    let items = outcome
+        .items
+        .iter()
+        .map(|item| OrderCreatedItem {
+            sku: item.sku.clone(),
+            quantity: item.quantity,
+        })
+        .collect();
+    let envelope = build_order_created_envelope(
+        Uuid::now_v7(),
         order_id,
-        items: outcome
-            .items
-            .iter()
-            .map(|item| OrderCreatedItem {
-                sku: item.sku.clone(),
-                quantity: item.quantity,
-            })
-            .collect(),
-        amount: OrderCreatedAmount {
-            currency: outcome.order.currency.clone(),
-            minor_units: outcome.order.amount_minor,
-        },
-    };
-    let envelope = Envelope {
-        event_id: Uuid::now_v7(),
-        event_type: ORDER_CREATED_EVENT_TYPE.to_string(),
-        schema_version: ORDER_CREATED_SCHEMA_VERSION,
-        occurred_at: Utc::now(),
-        producer: ORDERS_PRODUCER_NAME.to_string(),
-        aggregate_type: ORDER_AGGREGATE_TYPE.to_string(),
-        aggregate_id: order_id,
-        aggregate_version: outcome.order.version,
+        outcome.order.version,
+        items,
+        outcome.order.currency.clone(),
+        outcome.order.amount_minor,
         correlation_id,
-        causation_id: Uuid::now_v7(),
-        traceparent: None,
-        payload,
-    };
+        Uuid::now_v7(),
+    );
     let bytes = serde_json::to_vec(&envelope).expect("envelope serialization cannot fail");
-    let headers = event_headers(&envelope.event_id, envelope.correlation_id, envelope.causation_id);
+    let headers = event_headers(
+        &envelope.event_id,
+        envelope.correlation_id,
+        envelope.causation_id,
+    );
 
     state
         .producer
