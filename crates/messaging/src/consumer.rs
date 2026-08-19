@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use rskafka::client::partition::{PartitionClient, UnknownTopicHandling};
+use rskafka::client::partition::{OffsetAt, PartitionClient, UnknownTopicHandling};
 use rskafka::client::{Client, ClientBuilder};
 use tokio::sync::Mutex;
 
@@ -36,6 +36,12 @@ pub trait Consumer: Send + Sync {
         offset: i64,
         max_wait_ms: i32,
     ) -> Result<Vec<ConsumedRecord>, MessagingError>;
+
+    /// The next offset that will be assigned on this topic (the high
+    /// watermark). Tests use this to seed a fresh offset ledger at "now"
+    /// on a real, shared, already-populated topic instead of replaying
+    /// every record ever published to it.
+    async fn latest_offset(&self, topic: &str) -> Result<i64, MessagingError>;
 }
 
 pub struct RskafkaConsumer {
@@ -94,6 +100,11 @@ impl Consumer for RskafkaConsumer {
             })
             .collect())
     }
+
+    async fn latest_offset(&self, topic: &str) -> Result<i64, MessagingError> {
+        let partition_client = self.partition_client(topic).await?;
+        Ok(partition_client.get_offset(OffsetAt::Latest).await?)
+    }
 }
 
 /// A [`Consumer`] that always returns no records, for tests that don't
@@ -110,6 +121,10 @@ impl Consumer for NoopConsumer {
         _max_wait_ms: i32,
     ) -> Result<Vec<ConsumedRecord>, MessagingError> {
         Ok(Vec::new())
+    }
+
+    async fn latest_offset(&self, _topic: &str) -> Result<i64, MessagingError> {
+        Ok(0)
     }
 }
 
