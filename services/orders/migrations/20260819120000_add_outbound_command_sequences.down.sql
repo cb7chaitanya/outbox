@@ -1,0 +1,1 @@
+drop table outbound_command_sequences;

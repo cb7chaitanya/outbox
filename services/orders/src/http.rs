@@ -271,7 +271,7 @@ async fn create_order(
         &normalized,
         correlation_id,
         Utc::now(),
-        move |order_id, order_version| {
+        move |order_id, order_version, inventory_command_version| {
             if delivery_mode != DeliveryMode::Outbox {
                 return Vec::new();
             }
@@ -296,7 +296,7 @@ async fn create_order(
                 producer: ORDERS_PRODUCER_NAME.to_string(),
                 aggregate_type: RESERVE_INVENTORY_AGGREGATE_TYPE.to_string(),
                 aggregate_id: order_id,
-                aggregate_version: order_version,
+                aggregate_version: inventory_command_version,
                 correlation_id,
                 causation_id,
                 traceparent: None,
@@ -329,7 +329,7 @@ async fn create_order(
                     id: reserve_inventory_event_id,
                     aggregate_type: RESERVE_INVENTORY_AGGREGATE_TYPE.to_string(),
                     aggregate_id: order_id,
-                    aggregate_version: order_version,
+                    aggregate_version: inventory_command_version,
                     topic: INVENTORY_COMMANDS_TOPIC.to_string(),
                     message_key: order_id.to_string(),
                     envelope: reserve_inventory_json,

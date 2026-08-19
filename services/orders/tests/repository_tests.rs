@@ -43,7 +43,7 @@ async fn concurrent_identical_idempotent_requests_yield_one_order(pool: PgPool) 
                 &normalized,
                 Uuid::now_v7(),
                 Utc::now(),
-                |_, _| Vec::new(),
+                |_, _, _| Vec::new(),
             )
             .await
         }));
@@ -81,7 +81,7 @@ async fn concurrent_identical_idempotent_requests_yield_one_order(pool: PgPool) 
 async fn reused_idempotency_key_with_different_body_is_rejected(pool: PgPool) {
     let key = "reuse-key-001";
     let first = validate_and_normalize(sample_request()).unwrap();
-    repository::create_order(&pool, key, &first, Uuid::now_v7(), Utc::now(), |_, _| {
+    repository::create_order(&pool, key, &first, Uuid::now_v7(), Utc::now(), |_, _, _| {
         Vec::new()
     })
     .await
@@ -101,7 +101,7 @@ async fn reused_idempotency_key_with_different_body_is_rejected(pool: PgPool) {
         &different,
         Uuid::now_v7(),
         Utc::now(),
-        |_, _| Vec::new(),
+        |_, _, _| Vec::new(),
     )
     .await;
     assert!(
@@ -130,7 +130,7 @@ async fn same_key_same_body_replays_original_order(pool: PgPool) {
         &normalized,
         Uuid::now_v7(),
         Utc::now(),
-        |_, _| Vec::new(),
+        |_, _, _| Vec::new(),
     )
     .await
     .unwrap();
@@ -140,7 +140,7 @@ async fn same_key_same_body_replays_original_order(pool: PgPool) {
         &normalized,
         Uuid::now_v7(),
         Utc::now(),
-        |_, _| Vec::new(),
+        |_, _, _| Vec::new(),
     )
     .await
     .unwrap();
@@ -161,7 +161,7 @@ async fn create_pending_order(pool: &PgPool, key: &str) -> repository::OrderRow 
         &normalized,
         Uuid::now_v7(),
         Utc::now(),
-        |_, _| Vec::new(),
+        |_, _, _| Vec::new(),
     )
     .await
     .unwrap()

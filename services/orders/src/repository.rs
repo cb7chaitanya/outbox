@@ -119,13 +119,51 @@ fn fingerprint(normalized: &NormalizedOrder) -> String {
 pub trait OutboxEventBuilder: FnOnce(Uuid, i64) -> Vec<NewOutboxEvent> {}
 impl<F: FnOnce(Uuid, i64) -> Vec<NewOutboxEvent>> OutboxEventBuilder for F {}
 
+/// Like [`OutboxEventBuilder`] but for [`create_order`] specifically: also
+/// receives the freshly reserved `inventory` command-version (spec section
+/// 14 ordering policy) for the `reserve_inventory` command every created
+/// order emits under `DELIVERY_MODE=outbox`. A separate trait rather than
+/// widening `OutboxEventBuilder` itself, since [`transition_order_with_outbox`]'s
+/// callers already hold the transaction connection needed to reserve a
+/// command version themselves (see `docs/adr/0011-per-target-command-version-counter.md`)
+/// and have no need for this third parameter.
+pub trait CreateOrderOutboxEventBuilder: FnOnce(Uuid, i64, i64) -> Vec<NewOutboxEvent> {}
+impl<F: FnOnce(Uuid, i64, i64) -> Vec<NewOutboxEvent>> CreateOrderOutboxEventBuilder for F {}
+
+/// Atomically reserves the next version in orders' per-`(order_id, target)`
+/// outbound command sequence, starting at 1. `target` is a downstream
+/// service name (`"inventory"`, `"payments"`) — each is tracked
+/// independently, matching how each downstream consumer's own
+/// `consumer_aggregate_versions` row for this order is scoped to only the
+/// commands *that consumer* receives (spec section 14). Must run in the
+/// same transaction as the outbox insert this version will be stamped on,
+/// so a rolled-back transaction never leaves a gap a real command will
+/// later fail to fill.
+pub async fn reserve_command_version(
+    conn: &mut sqlx::PgConnection,
+    order_id: Uuid,
+    target: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "insert into outbound_command_sequences (order_id, target, next_version) \
+         values ($1, $2, 2) \
+         on conflict (order_id, target) do update set \
+           next_version = outbound_command_sequences.next_version + 1 \
+         returning next_version - 1",
+    )
+    .bind(order_id)
+    .bind(target)
+    .fetch_one(&mut *conn)
+    .await
+}
+
 pub async fn create_order(
     pool: &PgPool,
     idempotency_key: &str,
     normalized: &NormalizedOrder,
     correlation_id: Uuid,
     now: DateTime<Utc>,
-    build_outbox_event: impl OutboxEventBuilder,
+    build_outbox_event: impl CreateOrderOutboxEventBuilder,
 ) -> Result<CreateOutcome, RepoError> {
     let request_hash = fingerprint(normalized);
     let order_id = Uuid::now_v7();
@@ -197,7 +235,8 @@ pub async fn create_order(
     .execute(&mut *tx)
     .await?;
 
-    for event in build_outbox_event(order.id, order.version) {
+    let inventory_command_version = reserve_command_version(&mut tx, order.id, "inventory").await?;
+    for event in build_outbox_event(order.id, order.version, inventory_command_version) {
         persistence::outbox::insert(&mut tx, now, &event).await?;
     }
 
