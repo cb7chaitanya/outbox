@@ -6,6 +6,8 @@
 //! `inbox_events`/`consumer_aggregate_versions` shapes (spec section 14)
 //! land in M04.
 
+pub mod dlq;
+pub mod inbox;
 pub mod outbox;
 
 pub const OUTBOX_TABLE: &str = "outbox_events";
