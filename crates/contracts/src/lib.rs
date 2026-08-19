@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub mod inventory;
 pub mod orders;
+pub mod payments;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<P> {
