@@ -61,6 +61,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # testing
 proptest = { version = "1" }
 
+# randomness (full-jitter backoff; spec section 15)
+rand = { version = "0.8" }
+
 # workspace-local crates
 domain-common = { path = "crates/domain-common" }
 contracts = { path = "crates/contracts" }

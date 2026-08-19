@@ -1285,8 +1285,14 @@ name = "persistence"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "messaging",
+ "rand",
  "serde_json",
  "sqlx",
+ "test-support",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
