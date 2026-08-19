@@ -6,27 +6,13 @@
 
 mod common;
 
-use std::time::Duration;
-
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use contracts::Envelope;
 use contracts::orders::OrderCreatedPayload;
-use rskafka::client::ClientBuilder;
-use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
-
-fn broker() -> String {
-    std::env::var("REDPANDA_BROKER").unwrap_or_else(|_| "localhost:19092".to_string())
-}
-
-async fn body_json(response: axum::response::Response) -> Value {
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap()
-}
 
 fn post_order(key: &str, body: Value) -> Request<Body> {
     Request::builder()
@@ -55,53 +41,6 @@ fn sample_body() -> Value {
     })
 }
 
-/// Reads every `orders.order_created` envelope currently on the topic
-/// (from `Earliest` to the current high watermark) whose `aggregate_id`
-/// matches `order_id`. A bounded, single-shot fetch against a
-/// locally-owned dev topic — callers wrap it in their own bounded poll
-/// loop rather than this function looping internally, so the timing bound
-/// lives in one place (spec section 18).
-async fn matching_order_created_records(
-    order_id: uuid::Uuid,
-) -> Vec<Envelope<OrderCreatedPayload>> {
-    let client = ClientBuilder::new(vec![broker()])
-        .build()
-        .await
-        .expect("connect to redpanda");
-    let partition = client
-        .partition_client(
-            contracts::orders::ORDER_CREATED_TOPIC,
-            0,
-            UnknownTopicHandling::Error,
-        )
-        .await
-        .expect("orders.events.v1 partition client");
-    let earliest = partition
-        .get_offset(OffsetAt::Earliest)
-        .await
-        .expect("earliest offset");
-    let (records, _high_watermark) = partition
-        .fetch_records(earliest, 0..50_000_000, 1_000)
-        .await
-        .expect("fetch records");
-
-    records
-        .into_iter()
-        .filter_map(|r| {
-            let value = r.record.value?;
-            let envelope: Envelope<OrderCreatedPayload> = serde_json::from_slice(&value).ok()?;
-            (envelope.aggregate_id == order_id).then_some(envelope)
-        })
-        .collect()
-}
-
-/// Generous, centralized, and documented per spec section 18: "any
-/// unavoidable timing bound is generous, centralized, and documented."
-/// Used both to wait for records that should arrive and, in the negative
-/// case, as the window we poll before concluding none ever will.
-const POLL_BOUND: Duration = Duration::from_millis(1500);
-const POLL_INTERVAL: Duration = Duration::from_millis(150);
-
 #[sqlx::test(migrations = "./migrations")]
 async fn dual_write_db_commit_without_event(pool: PgPool) {
     let state = common::live_state(pool.clone()).await;
@@ -122,7 +61,7 @@ async fn dual_write_db_commit_without_event(pool: PgPool) {
     // fault fires right after, before any publish is attempted, so the
     // client sees an injected failure even though the order now exists.
     assert_eq!(create_response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let problem = body_json(create_response).await;
+    let problem = common::body_json(create_response).await;
     assert_eq!(problem["code"], "INJECTED_FAULT");
 
     let order_id: uuid::Uuid =
@@ -132,12 +71,12 @@ async fn dual_write_db_commit_without_event(pool: PgPool) {
             .await
             .expect("the order row must exist despite the client-visible failure");
 
-    let mut records = Vec::new();
-    let deadline = tokio::time::Instant::now() + POLL_BOUND;
-    while tokio::time::Instant::now() < deadline {
-        records = matching_order_created_records(order_id).await;
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    let records = common::poll_until::<OrderCreatedPayload>(
+        contracts::orders::ORDER_CREATED_TOPIC,
+        order_id,
+        1,
+    )
+    .await;
 
     assert!(
         records.is_empty(),
@@ -178,18 +117,15 @@ async fn dual_write_publish_then_retry_duplicate(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(retry.status(), StatusCode::ACCEPTED);
-    let retry_body = body_json(retry).await;
+    let retry_body = common::body_json(retry).await;
     let order_id = uuid::Uuid::parse_str(retry_body["id"].as_str().unwrap()).unwrap();
 
-    let mut records = Vec::new();
-    let deadline = tokio::time::Instant::now() + POLL_BOUND;
-    while tokio::time::Instant::now() < deadline {
-        records = matching_order_created_records(order_id).await;
-        if records.len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    let records = common::poll_until::<OrderCreatedPayload>(
+        contracts::orders::ORDER_CREATED_TOPIC,
+        order_id,
+        2,
+    )
+    .await;
 
     assert_eq!(
         records.len(),
