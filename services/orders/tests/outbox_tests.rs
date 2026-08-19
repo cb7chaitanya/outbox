@@ -248,7 +248,7 @@ impl Producer for FlakyProducer {
         if self.up.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(MessagingError::NotImplemented("simulated broker outage"))
+            Err(MessagingError::Unavailable("simulated broker outage"))
         }
     }
 }

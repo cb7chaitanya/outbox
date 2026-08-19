@@ -50,7 +50,7 @@ mod tests {
             correlation_id: Uuid::now_v7(),
             causation_id: Uuid::now_v7(),
             traceparent: None,
-            payload: json!({"order_id": "placeholder"}),
+            payload: json!({"order_id": "018f0d56-9d45-7c01-a0aa-000000000001"}),
         };
         let serialized = serde_json::to_string(&env).unwrap();
         let deserialized: Envelope<serde_json::Value> = serde_json::from_str(&serialized).unwrap();

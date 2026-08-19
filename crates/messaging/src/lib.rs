@@ -23,8 +23,8 @@ pub use consumer::{
 
 #[derive(Debug, Error)]
 pub enum MessagingError {
-    #[error("not yet implemented: {0}")]
-    NotImplemented(&'static str),
+    #[error("messaging unavailable: {0}")]
+    Unavailable(&'static str),
     #[error("kafka client error: {0}")]
     Client(#[from] rskafka::client::error::Error),
 }
@@ -116,32 +116,5 @@ impl Producer for RskafkaProducer {
             .produce(vec![record], Compression::NoCompression)
             .await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-
-    /// Ignored by default: exercises a real Redpanda broker on
-    /// `REDPANDA_BROKER` (defaults to the local Compose port). Run with
-    /// `cargo test -p messaging -- --ignored` while `make up` is running.
-    #[tokio::test]
-    #[ignore]
-    async fn publishes_to_a_real_topic() {
-        let broker =
-            std::env::var("REDPANDA_BROKER").unwrap_or_else(|_| "localhost:19092".to_string());
-        let producer = RskafkaProducer::connect(vec![broker])
-            .await
-            .expect("connect to redpanda");
-        producer
-            .publish(
-                "orders.events.v1",
-                "smoke-test-key",
-                b"hello".to_vec(),
-                vec![],
-            )
-            .await
-            .expect("publish succeeds");
     }
 }

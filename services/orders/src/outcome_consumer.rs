@@ -7,8 +7,7 @@
 //! `event_type`, which is unique across both topics, so nothing here needs
 //! to know which topic a record came from beyond what it fetched it from.
 //!
-//! M06 wires the full choreography-first happy path through
-//! `PAYMENT_AUTHORIZED` and the first two rows of the compensation matrix:
+//! Implements the full choreography and compensation matrix:
 //!
 //! - `reservation_succeeded` -> `INVENTORY_RESERVED`, records
 //!   `reservation_id` (needed later to release it), emits
@@ -16,17 +15,14 @@
 //! - `reservation_failed` -> `CANCELLING` -> `CANCELLED` directly (nothing
 //!   was ever reserved or paid, so no compensation command is needed —
 //!   matrix row 1).
-//! - `payment_authorized` -> `PAYMENT_AUTHORIZED`. M06 stops here; driving
-//!   fulfilment readiness is M07's job.
+//! - `payment_authorized` derives readiness and emits `create_fulfilment`.
 //! - `payment_failed` -> `CANCELLING`, emits `release_inventory` (matrix
 //!   row 2).
 //! - `inventory_released` -> `CANCELLED` (the release confirmation matrix
 //!   row 2 waits for before finalizing).
 //!
-//! Rows 3 and 4 of the compensation matrix (fulfilment failure -> refund +
-//! release; compensation retry exhaustion -> `MANUAL_REVIEW`) depend on
-//! fulfilment, which doesn't exist until M07 — not implemented here. See
-//! `docs/progress.md` for the scope boundary and
+//! Fulfilment failure emits refund plus release and waits for both; exhausted
+//! compensation enters `MANUAL_REVIEW`. See
 //! `docs/adr/0010-orders-consumes-reservation-outcomes.md` /
 //! `docs/adr/0011-per-target-command-version-counter.md` for the M05
 //! groundwork and version-counter fix this builds on.
@@ -154,7 +150,7 @@ fn build_authorize_payment_event(
         aggregate_version: command_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: AuthorizePaymentPayload {
             order_id,
             payment_id,
@@ -194,7 +190,7 @@ fn build_release_inventory_event(
         aggregate_version: command_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: ReleaseInventoryPayload {
             order_id,
             reservation_id,
@@ -231,7 +227,7 @@ fn build_create_fulfilment_event(
         aggregate_version: command_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: CreateFulfilmentPayload {
             order_id,
             reservation_id,
@@ -268,7 +264,7 @@ fn build_refund_payment_event(
         aggregate_version: command_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: RefundPaymentPayload {
             order_id,
             payment_id,
@@ -304,7 +300,7 @@ fn build_completed_event(
         aggregate_version: order_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: OrderCompletedPayload {
             order_id,
             fulfilment_id,
@@ -339,7 +335,7 @@ fn build_cancelled_event(
         aggregate_version: order_version,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: OrderCancelledPayload {
             order_id,
             reason_code: reason.to_string(),
@@ -514,6 +510,7 @@ async fn handle_one(
             return Ok(HandleOutcome::Stale);
         }
         VersionDecision::Gap => {
+            persistence::metrics::record_gap();
             persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now)
                 .await?;
             tx.commit().await?;
@@ -1106,6 +1103,11 @@ async fn handle_one(
     persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now).await?;
     tx.commit().await?;
 
+    tracing::info!(event_id = %envelope.event_id, correlation_id = %envelope.correlation_id,
+        causation_id = %envelope.causation_id, aggregate_id = %envelope.aggregate_id,
+        aggregate_version = envelope.aggregate_version, topic = source_topic,
+        partition = SOURCE_PARTITION, offset = record.offset, result = "applied", "event handled");
+
     Ok(HandleOutcome::Applied)
 }
 
@@ -1141,6 +1143,9 @@ pub async fn process_available(
     let start_offset =
         persistence::inbox::fetch_offset(pool, CONSUMER_NAME, source_topic, SOURCE_PARTITION)
             .await?;
+    persistence::metrics::set_consumer_lag(
+        consumer.latest_offset(source_topic).await? - start_offset,
+    );
     let records = consumer
         .fetch(source_topic, start_offset, max_wait_ms)
         .await?;
@@ -1155,10 +1160,22 @@ pub async fn process_available(
     for record in &ordered_records {
         let outcome = handle_one(pool, producer, source_topic, record).await?;
         match outcome {
-            HandleOutcome::Applied => summary.applied += 1,
-            HandleOutcome::Duplicate => summary.duplicate += 1,
-            HandleOutcome::Stale => summary.stale += 1,
-            HandleOutcome::Poison => summary.poison += 1,
+            HandleOutcome::Applied => {
+                summary.applied += 1;
+                persistence::metrics::record_result("applied");
+            }
+            HandleOutcome::Duplicate => {
+                summary.duplicate += 1;
+                persistence::metrics::record_result("duplicate");
+            }
+            HandleOutcome::Stale => {
+                summary.stale += 1;
+                persistence::metrics::record_result("stale");
+            }
+            HandleOutcome::Poison => {
+                summary.poison += 1;
+                persistence::metrics::record_result("poison");
+            }
         }
 
         if fault_injector
