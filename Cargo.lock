@@ -1288,6 +1288,7 @@ dependencies = [
  "chrono",
  "messaging",
  "rand",
+ "serde",
  "serde_json",
  "sqlx",
  "test-support",
