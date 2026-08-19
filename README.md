@@ -1,395 +1,136 @@
-# Project 2: Event-Driven Order System
+# Event-Driven Order System
 
-A learning project, not a storefront. It builds a deliberately unsafe
-database-plus-Kafka dual-write order system, reproduces its two
-inconsistency windows on purpose, then evolves it — transactional
-outbox, idempotent consumers, event choreography, compensation, and an
-optional saga orchestrator — until the same failures are handled
-correctly. See `PROJECT_2_SPEC.md` for the full contract this repository
-implements, milestone by milestone.
-
-## What's built so far (M00-M06)
-
-Workspace scaffolding (M00), the orders service's local-consistency core
-(M01: idempotent order creation, versioned state machine, transition
-history), the naive dual-write stage plus its failure lab (M02), the
-transactional outbox that replaces it as the default (M03), and the
-inventory service's idempotent reservation consumer (M04): `orders` now
-inserts a business mutation and its outbox event(s) in one database
-transaction — since M04, that includes an explicit
-`inventory.reserve_inventory` command alongside `order_created` (see
-`docs/adr/0007-orders-emits-reserve-inventory-command.md`) — and a
-background publisher worker claims rows with `FOR UPDATE SKIP LOCKED`
-leases and publishes them independently of the request path, retrying
-with full-jitter backoff on failure. `inventory` consumes that command
-through the idempotent-inbox protocol (spec section 14): dedupe by
-`(consumer, event_id)`, verify a duplicate's payload hash, decide
-apply/stale/gap by aggregate version, reserve stock all-or-nothing with
-sorted-order row locking (never oversells, never partially reserves a
-multi-SKU request), reply with `reservation_succeeded`/`reservation_failed`
-through its own outbox, and dead-letter anything it can't process
-(malformed envelope, unsupported schema, out-of-order gap) without
-blocking the rest of the partition.
-
-M05 adds the `payments` service: `orders` consumes
-`reservation_succeeded`/`reservation_failed` from `inventory.events.v1`
-and, on success, emits `payments.authorize_payment` — all in one
-transaction (see `docs/adr/0010-orders-consumes-reservation-outcomes.md`).
-`payments` authorizes against an in-process fake provider that honors its
-own idempotency keys independently of this service's inbox/outbox layers,
-applies spec section 15's error classification and full-jitter-backoff
-retry budget around it, and emits
-`payment_authorized`/`payment_failed`/`payment_refunded`.
-
-M06 completes the choreography-first happy path through
-`PAYMENT_AUTHORIZED` and the first two rows of the compensation matrix
-(spec section 12): orders' outcome consumer now also reacts to
-`payments.events.v1`, and every outbound command (`reserve_inventory`,
-`authorize_payment`, `release_inventory`) is versioned by a real per-
-`(order, downstream target)` counter rather than a placeholder constant
-(see `docs/adr/0011-per-target-command-version-counter.md`). A rejected
-reservation now cancels the order directly — nothing to compensate, no
-payment ever attempted. A payment decline drives inventory to release the
-reservation via a new `inventory.release_inventory`/`inventory_released`
-round trip, and the order only reaches `CANCELLED` once that release is
-confirmed, not before. A real `POST /v1/orders` now reaches
-`PAYMENT_AUTHORIZED` in well under two seconds with no manual steps — see
-`docs/evidence/m06.md` for a live, end-to-end transcript (including a real
-poison-isolation bug this exact run caught and fixed). The naive publish
-path from M02 stays runnable behind `DELIVERY_MODE=naive` so its failure
-lab remains reproducible; `DELIVERY_MODE=outbox` is the default.
-Fulfilment remains a health-endpoint skeleton, and compensation matrix
-rows 3-4 (fulfilment failure, retry exhaustion → `MANUAL_REVIEW`) are not
-yet implemented — both are M07's job. Track progress in
-[`docs/progress.md`](docs/progress.md).
+A production-shaped learning system for transactional outboxes, idempotent
+consumers, ordering, replay, choreography, compensation, and recovery. It
+retains a naive dual-write mode so its failures can be compared with the
+correct design. Delivery is at least once with effectively-once business
+effects—not a claim of end-to-end exactly once.
 
 ## Architecture
 
 ```text
-Client
-  |
-  v
-Orders API ---- PostgreSQL (orders + transitions + outbox + inbox)
-  | outbox publisher
-  v
-Redpanda topics
-  |--------------------|--------------------|
-  v                    v                    v
-Inventory          Payments             Fulfilment
-PostgreSQL         PostgreSQL            PostgreSQL
- + outbox/inbox     + outbox/inbox        + outbox/inbox
-  |                    |                    |
-  +--------------------+--------------------+
-                       events
-                         |
-                         v
-                     Orders projection/state machine
+Client -> Orders API/DB/outbox -> Redpanda
+                                  /   |   \
+                       Inventory  Payments  Fulfilment
+                             \       |       /
+                              outcome events
+                                    |
+                            Orders state machine
 ```
-
-Optional final extension: a saga orchestrator (M11) consumes workflow
-events and emits commands. It does not exist until choreography (M06/M07)
-is complete.
 
 | Service | Owns | Port |
-|---|---|---|
-| orders | order lifecycle, client idempotency, transition history | 8081 |
+|---|---|---:|
+| orders | lifecycle, idempotency, transitions, saga decisions | 8081 |
 | inventory | stock and reservations | 8082 |
-| payments | payment attempts and refunds | 8083 |
-| fulfilment | shipment/fulfilment creation | 8084 |
-| saga-orchestrator (optional, M11) | saga instance and step state only | — |
+| payments | authorizations, refunds, provider ledger | 8083 |
+| fulfilment | fulfilment creation outcome | 8084 |
 
-Each service owns its tables exclusively — separate databases, separate
-migrations, separate SQLx pools, no cross-service joins (see
-`migrations/README.md`).
+Every service owns a separate Postgres database, inbox, outbox, migrations,
+and offset ledger. There are no cross-service database joins.
 
-## Prerequisites
+## Five-minute quick start
 
-- Rust via `rustup` (toolchain pinned in `rust-toolchain.toml`, currently
-  1.94.0, with `rustfmt` and `clippy` components).
-- Docker with Compose v2 (`docker compose version`).
+Prerequisites: Docker Compose v2 and Rust via `rustup` (Rust 1.94 is pinned).
 
-## Quick start (five minutes)
-
-```sh
-make setup   # validates tools, copies .env.example -> .env, builds the workspace
-make up      # starts PostgreSQL + Redpanda + Redpanda Console, waits for health
-make topics  # explicitly creates the workflow + DLQ topics (auto-creation is disabled)
+```bash
+make setup
+make up
 ```
 
-Then, in separate terminals, run any service:
+`make up` starts infrastructure, creates topics, runs migrations, builds all
+four services, and waits for readiness.
 
-```sh
-cargo run -p orders       # GET http://localhost:8081/health/live
-cargo run -p inventory    # GET http://localhost:8082/health/live
-cargo run -p payments     # GET http://localhost:8083/health/live
-cargo run -p fulfilment   # GET http://localhost:8084/health/live
-```
+```bash
+curl -X PUT localhost:8082/_dev/stock/SKU-1 \
+  -H 'content-type: application/json' -d '{"available_qty":50}'
 
-```sh
-curl http://localhost:8081/health/live
-curl http://localhost:8081/health/ready
-```
-
-`orders` and `inventory` check a real Postgres connection (bounded 2s
-timeout) for `/health/ready`; `payments` and `fulfilment` still return
-`200 ok` unconditionally until their own persistence lands (M05+).
-
-### Inventory dev endpoints
-
-`inventory` exposes dev/test-only stock seed/read endpoints (spec
-section 6):
-
-```sh
-curl -X PUT http://localhost:8082/_dev/stock/SKU-1 \
-  -H "Content-Type: application/json" -d '{"available_qty": 50}'
-curl http://localhost:8082/_dev/stock/SKU-1
-```
-
-### Orders API example
-
-```sh
-curl -i -X POST http://localhost:8081/v1/orders \
-  -H "Idempotency-Key: demo-key-001" \
-  -H "Content-Type: application/json" \
+curl -i -X POST localhost:8081/v1/orders \
+  -H 'content-type: application/json' -H 'idempotency-key: demo-001' \
+  -H 'x-correlation-id: 018f0d56-9d45-7c01-a0aa-000000000001' \
   -d '{"items":[{"sku":"SKU-1","quantity":2,"unit_price_minor":1250}],"currency":"USD"}'
-# -> 202 Accepted, Location: /v1/orders/<id>, body is the order representation
 
-curl http://localhost:8081/v1/orders/<id>
-curl http://localhost:8081/v1/orders/<id>/transitions
+curl localhost:8081/v1/orders/ORDER_ID
+curl localhost:8081/v1/orders/ORDER_ID/transitions
 ```
 
-Repeating the same `POST` with the same `Idempotency-Key` and the same
-body replays the original `202` response (no second order is created).
-The same key with a different body returns `409 IDEMPOTENCY_KEY_REUSED`.
+The same key/body replays the original response. The same key with another
+body returns `409 IDEMPOTENCY_KEY_REUSED`.
 
-Pass `X-Correlation-ID: <uuid>` to control the order's correlation ID; if
-omitted (or unparseable), one is generated. It is persisted on the order
-row, returned in the response body's `correlation_id` field, and echoed
-back as an `X-Correlation-ID` response header — the same ID a client
-would later grep for in `make logs ORDER_ID=<uuid>` once events exist to
-carry it (M02+).
+## Workflow and compensation
 
-Redpanda Console: http://localhost:8090. Postgres is reachable at
-`localhost:55432` (not the default `5432` — see `.env.example`) with the
-credentials in `.env`.
+```text
+PENDING -> INVENTORY_RESERVED -> PAYMENT_AUTHORIZED
+        -> READY_FOR_FULFILMENT -> COMPLETED
+```
 
-## Ports
+- Inventory rejection cancels without payment.
+- Payment failure releases inventory before cancellation.
+- Fulfilment failure refunds and releases; cancellation waits for both.
+- Exhausted compensation emits a DLQ/operator signal and enters
+  `MANUAL_REVIEW`.
 
-| Service | Port |
-|---|---|
-| orders | 8081 |
-| inventory | 8082 |
-| payments | 8083 |
-| fulfilment | 8084 |
-| PostgreSQL | 55432 (host) → 5432 (container) |
-| Redpanda (Kafka API) | 19092 |
-| Redpanda Console | 8090 |
+Commands are explicit. Correlation, causation, and `traceparent` propagate.
+Per-target command sequences prevent false cross-service version gaps.
 
-## Idempotency, correlation IDs, dual-write lab, outbox recovery
+## Dual-write lab and outbox recovery
 
-Idempotency and correlation-ID handling are implemented for order
-creation (M01, see the curl example above and `docs/evidence/m01.md`).
-
-**Naive dual-write lab (M02):** with `DELIVERY_MODE=naive` (opt-in since
-M03 — `outbox` is now the default), every accepted `POST /v1/orders` call
-commits the order in Postgres and then publishes `orders.order_created`
-directly to Kafka, with nothing tying the two together. Run
-
-```sh
+```bash
 make demo-naive-failure
 ```
 
-to see both resulting atomicity gaps reproduced live against your local
-stack: (1) the DB commits but the event is never published, and (2) both
-the DB commit and the publish succeed, but a naive client retry (after
-seeing a failure it can't distinguish from gap 1) causes a real duplicate
-event on the broker. The script builds and runs `orders` itself with
-failure injection enabled, prints each violation, and tears the process
-down on exit — no manual setup beyond `make up` first. Full explanation
-of why retries cannot close either gap: [`docs/failure-lab.md`](docs/failure-lab.md).
-Deterministic, automated versions of the same two demonstrations:
-`services/orders/tests/dual_write_tests.rs`.
+This reproduces DB-commit-without-publish and ambiguous-retry duplicate
+publication. Retries cannot atomically couple two systems; see
+[the failure lab](docs/failure-lab.md).
 
-**Transactional outbox (M03):** with `DELIVERY_MODE=outbox` (the
-default), order creation inserts the order row and its
-`orders.order_created` outbox row in one database transaction (spec
-section 13) — the event can never be lost the way the naive path loses
-it in gap 1, because there is no window between "the business change
-committed" and "the event is durably recorded" for a fault to land in.
-A background publisher worker independently claims unpublished rows
-with `FOR UPDATE SKIP LOCKED` and a lease, publishes them, and retries
-with full-jitter backoff on failure; a worker that dies between a
-successful publish and marking the row published causes the row to be
-republished once its lease expires — a legitimate at-least-once
-duplicate, not a lost event. Deterministic, automated demonstrations of
-all six M03 acceptance gates (atomic rollback, exactly-one-outbox-row,
-crash-then-duplicate-then-published, two publishers sharing a backlog
-without double-publishing, broker-outage backlog growth and drain, and
-the closed lost-event window): `services/orders/tests/outbox_tests.rs`.
-Backlog/publish/lease-recovery counters: `GET /metrics` on the orders
-service.
+Normal `DELIVERY_MODE=outbox` commits state and event together. Publishers use
+short `FOR UPDATE SKIP LOCKED` leases. A crash after publish can republish, but
+inbox identity/hash checks, versions, and provider idempotency make it harmless.
 
-**Idempotent inventory consumer (M04):** `orders`' outbox now carries a
-second event alongside `order_created` — an explicit
-`inventory.reserve_inventory` command, in the same transaction — which
-`inventory` consumes through the eight-step protocol in spec section 14:
-validate the envelope, claim `(consumer, event_id)` in its own inbox
-table (a duplicate delivery is a safe no-op, verified by comparing the
-stored payload hash), classify the aggregate version as apply/stale/gap,
-reserve stock all-or-nothing with SKU-sorted row locking (never oversells
-under concurrency, never partially reserves a multi-SKU request), publish
-`reservation_succeeded`/`reservation_failed` through its own transactional
-outbox, and only then advance its local offset ledger — never before the
-business transaction (or a DLQ publish, for a message it can't process)
-has already committed. `rskafka` has no consumer-group/offset-commit
-protocol, so "commit the offset" here means a row in `inventory`'s own
-`consumer_offsets` table rather than a broker API call; see
-`docs/adr/0006-inbox-consumer-offset-ledger.md`. Malformed envelopes,
-unsupported schema versions, and unresolved version gaps are dead-lettered
-to `inventory.commands.v1.dlq` without blocking other messages on the
-partition (invariant I15). Deterministic, automated demonstrations of all
-five M04 acceptance gates: `services/inventory/tests/consumer_tests.rs`.
+## Ordering, replay, and operations
 
-**Payments with retry taxonomy (M05):** on `reservation_succeeded`,
-`orders` transitions the order to `INVENTORY_RESERVED` and emits
-`payments.authorize_payment` — in the same transaction as the transition
-itself (`repository::transition_order_with_outbox`), so "reacted to the
-outcome" and "asked payments to authorize" are one atomic business
-change, not two (see `docs/adr/0010-orders-consumes-reservation-outcomes.md`).
-`payments` runs the same eight-step idempotent-inbox protocol as
-inventory, dispatching `authorize_payment`/`refund_payment` off one
-shared topic by `event_type`. Authorization calls an in-process fake
-provider that keeps its own idempotency-key ledger independent of this
-service's inbox/outbox tables — a redelivered or retried call is a cache
-hit there, never a second charge — wrapped in a bounded, full-jitter-
-backoff retry loop (spec section 15 defaults: base 100ms, cap 30s, max 8
-attempts, max elapsed 10 minutes) that only retries transient failures; a
-provider decline is a final business outcome (`payment_failed`), never
-retried, never DLQ'd. Refunds are idempotent the same way. Deterministic,
-automated demonstrations of all five M05 acceptance gates (timeout-then-
-success, lost-response-then-retry, decline, poison-DLQ, idempotent
-refund): `services/payments/tests/consumer_tests.rs`.
+Consumers apply, count stale, buffer recoverable fetched-window gaps, and DLQ
+unresolved gaps as `EXPECTED_VERSION_GAP`. Offsets advance only through a
+contiguous completed prefix.
 
-**Choreographed workflow and compensation (M06):** `orders`' outcome
-consumer now dispatches across both `inventory.events.v1` and
-`payments.events.v1` by `event_type` (one module, one consumer name, two
-background poll loops). `payment_authorized` drives
-`INVENTORY_RESERVED`→`PAYMENT_AUTHORIZED` (M06 stops there; readiness for
-fulfilment is M07's job). `reservation_failed` now drives real
-compensation — `PENDING`→`CANCELLING`→`CANCELLED` directly, since nothing
-was ever reserved or paid, so nothing needs releasing. `payment_failed`
-emits `inventory.release_inventory` (a new consumer path on `inventory`,
-idempotent the same way `reserve`/authorize already are — releasing an
-already-released reservation is a no-op) and moves the order to
-`CANCELLING`; only `inventory_released`, inventory's confirmation event,
-moves it the rest of the way to `CANCELLED`. Every outbound command's
-`aggregate_version` now comes from a real per-`(order, target)` counter
-(`outbound_command_sequences`) instead of a hardcoded value — see
-`docs/adr/0011-per-target-command-version-counter.md` for why that
-mattered the moment a second command (`release_inventory`) joined
-`reserve_inventory` on the same orders→inventory relationship. Deterministic,
-automated demonstrations of all five M06 acceptance gates plus a
-poison-isolation regression test:
-`services/orders/tests/choreography_tests.rs`.
-
-This section grows as later milestones (fulfilment, the rest of the
-compensation matrix, M07+) land; see `docs/progress.md` for current
-status.
-
-## Delivery semantics
-
-At-least-once transport, effectively-once business effects — never a
-claim of end-to-end exactly-once delivery. See spec section 5.
-
-## Testing and chaos commands
-
-```sh
-make fmt              # cargo fmt --all
-make lint              # cargo clippy --workspace --all-targets --all-features -- -D warnings
-make test-unit          # cargo test --workspace --lib --bins
-make test-integration    # real Postgres/Redpanda integration tests (orders + inventory + payments)
-make test-e2e             # not yet implemented (M06/M07)
-make test                  # fmt + lint + test-unit + test-integration
-make demo-naive-failure     # runs both dual-write failure demonstrations live (M02)
-make chaos-smoke              # not yet implemented (M09)
-make logs ORDER_ID=<uuid>      # tails docker compose logs filtered to one order
+```bash
+cargo run -p replay-dlq -- inventory.commands.v1 DLQ_OFFSET localhost:19092
+docker compose --profile observability up -d
 ```
 
-## Troubleshooting
+Replay preserves the envelope's event/correlation identity and adds replay
+headers. Metrics cover outbox age, lag, results, gaps, retries, DLQ, and
+compensation age without ID/SKU/key labels. Prometheus is on 9090, Grafana on
+3000, Jaeger on 16686, and Redpanda Console on 8090. See
+[the runbook](docs/runbook.md).
 
-- **Port 5432 already in use**: another local Postgres is likely running.
-  This project defaults to host port `55432` for that reason
-  (`.env.example`); override `POSTGRES_PORT` if `55432` also collides.
-- **Redpanda unhealthy / crash-looping**: check `docker compose logs
-  redpanda`. This image's `rpk redpanda start` does not accept a `--set`
-  flag; auto-topic-creation is disabled post-startup by `make up`
-  instead (`rpk cluster config set auto_create_topics_enabled false`),
-  not via a start flag.
-- **`make topics` reports a topic already exists**: harmless — the
-  target is safe to re-run.
+## Verification
 
-## Reset warning
-
-`make reset` runs `docker compose down -v`, permanently deleting the
-Postgres and Redpanda volumes (all local data). It refuses to run
-without `CONFIRM=yes`:
-
-```sh
-make reset CONFIRM=yes
+```bash
+make test
+make test-e2e
+make chaos-smoke
+make demo-naive-failure
 ```
 
-`make down` stops containers without deleting data.
+Chaos covers broker/DB recovery, worker restart, poison isolation, correlated
+logs, and metrics using bounded polling. Evidence is under [docs/evidence](docs/evidence).
 
-## Configuration
+## Configuration, lifecycle, and trade-offs
 
-All configuration is environment-variable based; see `.env.example` for
-the full list (Postgres/Redpanda connection info, per-service ports,
-`ENVIRONMENT`, `FAILURE_INJECTION_ENABLED`/`FAILURE_INJECTION_TOKEN`,
-`DELIVERY_MODE`). Copy it to `.env` (done automatically by `make setup`)
-and adjust as needed. Never commit `.env`.
+`.env.example` documents configuration. Failure injection is off by default,
+token-protected, and refused in `production`.
 
-Failure injection (spec section 17) is off by default and refuses to
-start if `FAILURE_INJECTION_ENABLED=true` while `ENVIRONMENT=production`.
-When enabled, `orders` mounts `PUT /_test/faults/{name}` and
-`DELETE /_test/faults`, both requiring a matching `X-Test-Token` header
-(`FAILURE_INJECTION_TOKEN`). See `docs/adr/0004-fault-injector-placement-and-control.md`.
+```bash
+make migrate
+make down
+make reset CONFIRM=yes   # destructive local volume reset
+```
 
-## Known limitations
+Postgres uses host port 55432 and Redpanda 19092. `rskafka` avoids native build
+dependencies but lacks consumer groups, so the project uses a Postgres offset
+ledger and one active consumer per partition. Topics are single-partition for
+deterministic learning, not maximum throughput. Choreography is the required
+default; the M11 orchestrator is optional after core completion.
 
-- M00-M06: `orders`, `inventory`, and `payments` are wired end-to-end
-  through `PAYMENT_AUTHORIZED` (order creation → reservation → payment
-  authorization), and the first two compensation-matrix rows (inventory
-  rejected; payment failed after reservation) are implemented. Rows 3-4
-  (fulfilment failure → refund + release; compensation retry exhaustion →
-  `MANUAL_REVIEW`) are not — both need the fulfilment service, which
-  remains a health-endpoint skeleton with no persistence wiring, so its
-  `/health/ready` doesn't check a dependency yet. `READY_FOR_FULFILMENT`
-  and `COMPLETED` are therefore unreachable until M07.
-- An out-of-order aggregate version at any consumer goes straight to DLQ
-  (`EXPECTED_VERSION_GAP`) rather than through the bounded retry/buffer
-  window spec section 14 describes — that window is M08's deliverable by
-  name; see `docs/adr/0008-m04-gap-policy-scope-boundary.md`.
-- No consumer (inventory, payments, or orders' outcome consumer) is yet
-  safe to run as multiple concurrent replicas against the same
-  topic/partition (no consumer-group-style partition assignment) — see
-  `docs/adr/0006-inbox-consumer-offset-ledger.md`'s consequences section.
-- The naive publish path (still runnable behind `DELIVERY_MODE=naive`)
-  republishes on every accepted create call, including idempotent
-  replays — a deliberate, documented anti-pattern
-  (`docs/adr/0003-naive-publish-on-every-replay.md`), not a bug; the
-  outbox mode fixes this by only inserting an outbox row when a new
-  order is genuinely created.
-- The outbox publisher's retry backoff uses an unseeded RNG for M03
-  (full-jitter per spec section 15); deterministic/seeded retry timing
-  for tests is deferred to M08's invariant-harness milestone.
-- `POST /v1/orders/{id}/cancel` does not exist yet — it is optional per
-  spec section 10 and deferred until the compensation matrix is complete
-  (M07) gives it something meaningful to cancel from every reachable
-  state.
-- No orchestrator exists; it is optional and only added after M10
-  (core milestones) are complete, per spec section 24.
-
-## Runbook
-
-Operational runbook (`docs/runbook.md`) is added with M09 once there is
-something to operate (retries, DLQ, compensation, chaos controls).
+Read [the learning write-up](docs/blog.md), [ADRs](docs/adr), and
+[milestone evidence](docs/evidence).
