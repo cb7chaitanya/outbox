@@ -8,7 +8,7 @@
 - [x] M03 — Transactional outbox
 - [x] M04 — Inventory consumer and idempotent inbox
 - [x] M05 — Payments with retry taxonomy
-- [ ] M06 — Choreographed workflow and compensation
+- [x] M06 — Choreographed workflow and compensation
 - [ ] M07 — Fulfilment and complete compensation matrix
 - [ ] M08 — Ordering, replay, and concurrency hardening
 - [ ] M09 — Observability, chaos, and operations
@@ -17,7 +17,8 @@
 
 ## Current milestone
 
-M05 complete. Next action: M06 — choreographed workflow and compensation.
+M06 complete. Next action: M07 — fulfilment and complete compensation
+matrix.
 
 ## Decisions
 
@@ -160,6 +161,34 @@ M05 complete. Next action: M06 — choreographed workflow and compensation.
   (`payments.commands.v1`); the consumer dispatches on `event_type`
   rather than running two separate consumer loops, since both need the
   identical eight-step protocol and per-order version tracking.
+- M06: a real per-`(order_id, target)` outbound command-version counter
+  (`outbound_command_sequences`, `repository::reserve_command_version`)
+  replaces the hardcoded versions `reserve_inventory`/`authorize_payment`
+  relied on, so `release_inventory` (a second command to `"inventory"`)
+  doesn't look stale/gapped to inventory's inbox. See
+  `docs/adr/0011-per-target-command-version-counter.md`.
+- `orders` gained a `reservation_id` column (nullable, set on
+  `reservation_succeeded`) so a later `payment_failed` can build
+  `release_inventory`'s payload without a cross-service join (spec
+  section 6 forbids one).
+- Orders' outcome consumer now handles both `inventory.events.v1` and
+  `payments.events.v1` (one module, one consumer name, two
+  `process_available` loop instances in `main.rs`, dispatch on
+  `event_type` since it's unique across both topics).
+- Real bug found by this milestone's own live end-to-end check:
+  `TransitionError::NotFound` was propagated as a fatal `Err`, wedging the
+  outcome consumer's offset ledger forever on any record naming an order
+  the consumer's database has no row for. Fixed to DLQ as `UNKNOWN_ORDER`
+  instead (invariant I15) — see `docs/evidence/m06.md` for the full story
+  and the regression test.
+- M06 scope boundary (compensation matrix rows 3-4, section 12): fulfilment
+  failure → refund + release, and compensation retry exhaustion →
+  `MANUAL_REVIEW`, are **not** implemented — both depend on the fulfilment
+  service, which doesn't exist until M07. Details in `docs/evidence/m06.md`.
+  **M07 must add:** fulfilment service itself, the third compensation row
+  (refund payment + release inventory together, tracking both
+  confirmations before `CANCELLED`), and `MANUAL_REVIEW` on exhausted
+  compensation retries.
 
 ## Commands run and results (M00)
 
@@ -287,29 +316,53 @@ Total payments-service tests: 11 passed, 0 failed (6 unit + 5
 integration). Workspace-wide test count now in the 90s across all
 crates/services.
 
+## Commands run and results (M06)
+
+All commands below were actually run in this repository state on
+2026-08-19, against the M00-M05 infrastructure (still running). Full
+transcript excerpts, including all five M06 acceptance-gate proofs, the
+live end-to-end run, and the poison-isolation bug/fix, are in
+`docs/evidence/m06.md`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 warnings |
+| `cargo test --workspace --tests` (full suite) | all green across every crate/service |
+| `cargo test -p orders --test choreography_tests` | 6/6, all five M06 acceptance gates + 1 poison-isolation regression test |
+| same, repeated 2x more (default parallelism) + 1x with `--test-threads=1` | 6/6 every run, no flakes |
+| `cargo test -p inventory --test release_tests` | 2/2 |
+| `cargo test -p orders --tests` (regression check) | 42/42, no regressions from M01-M05 |
+| `make demo-naive-failure` | exit 0; M02 lab still reproduces both gaps unchanged |
+| live: `cargo run -p orders/inventory/payments`, seed stock, `POST /v1/orders`, poll order | `PENDING`→`INVENTORY_RESERVED`→`PAYMENT_AUTHORIZED` in ~1-2s; real stock decrement (50→47 available, 0→3 reserved); full transition history correct |
+
+Total orders-service tests: 42 passed, 0 failed (34 from M01-M05 unchanged
++ 6 new choreography/compensation acceptance tests + 2 new
+`outbound_command_sequences`/`reservation_id` migration coverage via
+existing tests). Total inventory-service tests: 14 passed, 0 failed (12
+from M04 + 2 new release tests). Workspace-wide test count now over 100
+across all crates/services.
+
 ## Next action
 
-Start M06: choreographed workflow and compensation. Two things M05
-explicitly deferred and named as M06 prerequisites (see ADR 0010 and the
-Decisions section above):
+Start M07: fulfilment and complete compensation matrix. Per the scope
+boundary above, M07 must:
 
-1. Wire the `reservation_failed` reaction in orders'
-   `outcome_consumer` — release nothing yet (no payment was attempted),
-   but drive the order to `CANCELLING`/`CANCELLED` per spec section 12's
-   compensation matrix's first row ("inventory rejected: no payment
-   attempted; cancel").
-2. Replace `outcome_consumer`'s hardcoded
-   `FIRST_PAYMENTS_COMMAND_VERSION = 1` with a real per-order,
-   per-downstream-consumer version counter before adding
-   `refund_payment` as a second command on the orders→payments
-   relationship — the current constant only stays correct while
-   `authorize_payment` is the only command orders ever sends to payments.
-
-Beyond those two, M06 wires the remaining compensation matrix rows
-(payment failed after reservation → release inventory, cancel after
-release confirmation; compensation transient failure → bounded retry;
-compensation retry budget exhausted → `MANUAL_REVIEW`), which needs new
-`inventory.release_inventory`/`inventory_released` and
-`payments.refund_payment`/`payment_refunded` wiring on the orders side
-(the payments side of refund already exists as of M05), and duplicated/
-reordered-outcome tests proving no illegal transitions occur.
+1. Build the fulfilment service (migrations, `fulfilments` table,
+   readiness command/event flow) — currently only a health-only skeleton
+   from M00.
+2. Extend orders' outcome consumer to derive fulfilment readiness from the
+   independent reservation/payment facts it already tracks (spec section
+   12: "store independent facts... and derive readiness") and emit
+   `fulfilment.create_fulfilment` once both are true.
+3. Drive `PAYMENT_AUTHORIZED`→`READY_FOR_FULFILMENT`→`COMPLETED` on
+   fulfilment success.
+4. Implement compensation matrix row 3 (fulfilment failure → refund
+   payment **and** release inventory, cancel only after **both**
+   confirmations) — this needs tracking which compensations are
+   pending/confirmed, since M06 only ever has one compensation in flight
+   at a time (release only).
+5. Implement row 4: compensation retry budget exhausted →
+   `MANUAL_REVIEW` with a DLQ/operator signal.
+6. Terminal-exclusivity and full-invariant tests under duplicates, per
+   M07's acceptance gates.
