@@ -117,6 +117,19 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     body.push_str(&format!(
         "outbox_lease_recoveries_total {lease_recoveries}\n"
     ));
+    body.push_str(&persistence::metrics::prometheus());
+    let compensation_age: Option<f64> = sqlx::query_scalar(
+        "select extract(epoch from (now() - min(updated_at)))::float8 \
+         from orders where status = 'CANCELLING'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(None);
+    body.push_str("# TYPE compensation_oldest_age_seconds gauge\n");
+    body.push_str(&format!(
+        "compensation_oldest_age_seconds {}\n",
+        compensation_age.unwrap_or(0.0)
+    ));
 
     (
         StatusCode::OK,
@@ -244,6 +257,10 @@ async fn create_order(
 ) -> Result<Response, ApiError> {
     let idempotency_key = extract_idempotency_key(&headers)?;
     let correlation_id = extract_or_generate_correlation_id(&headers);
+    let traceparent = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let normalized = validate_and_normalize(body)?;
 
     // Built once, up front, so each outbox row's event id stays stable even
@@ -284,6 +301,7 @@ async fn create_order(
                 event_amount_minor,
                 correlation_id,
                 causation_id,
+                traceparent.clone(),
             );
             let order_created_json =
                 serde_json::to_value(&order_created_envelope).expect("envelope serializes to json");
@@ -299,7 +317,7 @@ async fn create_order(
                 aggregate_version: inventory_command_version,
                 correlation_id,
                 causation_id,
-                traceparent: None,
+                traceparent: traceparent.clone(),
                 payload: ReserveInventoryPayload {
                     order_id,
                     items: event_items
@@ -368,8 +386,9 @@ fn event_headers(
     event_id: &Uuid,
     correlation_id: Uuid,
     causation_id: Uuid,
+    traceparent: Option<String>,
 ) -> Vec<(String, Vec<u8>)> {
-    vec![
+    let mut headers = vec![
         ("event_id".to_string(), event_id.to_string().into_bytes()),
         (
             "correlation_id".to_string(),
@@ -383,7 +402,11 @@ fn event_headers(
             "producer".to_string(),
             ORDERS_PRODUCER_NAME.to_string().into_bytes(),
         ),
-    ]
+    ];
+    if let Some(traceparent) = traceparent {
+        headers.push(("traceparent".to_string(), traceparent.into_bytes()));
+    }
+    headers
 }
 
 /// Builds an `orders.order_created` envelope. Shared by the naive publish
@@ -400,6 +423,7 @@ fn build_order_created_envelope(
     amount_minor: i64,
     correlation_id: Uuid,
     causation_id: Uuid,
+    traceparent: Option<String>,
 ) -> Envelope<OrderCreatedPayload> {
     Envelope {
         event_id,
@@ -412,7 +436,7 @@ fn build_order_created_envelope(
         aggregate_version: order_version,
         correlation_id,
         causation_id,
-        traceparent: None,
+        traceparent,
         payload: OrderCreatedPayload {
             order_id,
             items,
@@ -465,12 +489,14 @@ async fn publish_naive(
         outcome.order.amount_minor,
         correlation_id,
         Uuid::now_v7(),
+        None,
     );
     let bytes = serde_json::to_vec(&envelope).expect("envelope serialization cannot fail");
     let headers = event_headers(
         &envelope.event_id,
         envelope.correlation_id,
         envelope.causation_id,
+        envelope.traceparent.clone(),
     );
 
     state

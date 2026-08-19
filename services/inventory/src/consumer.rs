@@ -239,6 +239,7 @@ async fn handle_one(
             return Ok(HandleOutcome::Stale);
         }
         VersionDecision::Gap => {
+            persistence::metrics::record_gap();
             // M04 scope boundary (documented in ADR 0008): a bounded
             // retry/buffer window before DLQ is M08's ordering-hardening
             // milestone. For now an out-of-order arrival goes straight to
@@ -364,6 +365,11 @@ async fn handle_one(
     persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now).await?;
     tx.commit().await?;
 
+    tracing::info!(event_id = %envelope.event_id, correlation_id = %envelope.correlation_id,
+        causation_id = %envelope.causation_id, aggregate_id = %envelope.aggregate_id,
+        aggregate_version = envelope.aggregate_version, topic = source_topic,
+        partition = SOURCE_PARTITION, offset = record.offset, result = "applied", "event handled");
+
     Ok(HandleOutcome::Applied)
 }
 
@@ -396,7 +402,7 @@ fn build_reservation_outcome_event(
                 aggregate_version: 1,
                 correlation_id: envelope.correlation_id,
                 causation_id: envelope.event_id,
-                traceparent: None,
+                traceparent: envelope.traceparent.clone(),
                 payload: ReservationSucceededPayload {
                     order_id: payload.order_id,
                     reservation_id: outcome.reservation_id,
@@ -425,7 +431,7 @@ fn build_reservation_outcome_event(
                 aggregate_version: 1,
                 correlation_id: envelope.correlation_id,
                 causation_id: envelope.event_id,
-                traceparent: None,
+                traceparent: envelope.traceparent.clone(),
                 payload: ReservationFailedPayload {
                     order_id: payload.order_id,
                     reason_code: outcome
@@ -472,7 +478,7 @@ fn build_released_event(
         aggregate_version: 2,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: InventoryReleasedPayload {
             order_id: payload.order_id,
             reservation_id,
@@ -504,6 +510,9 @@ pub async fn process_available(
     let start_offset =
         persistence::inbox::fetch_offset(pool, CONSUMER_NAME, source_topic, SOURCE_PARTITION)
             .await?;
+    persistence::metrics::set_consumer_lag(
+        consumer.latest_offset(source_topic).await? - start_offset,
+    );
     let records = consumer
         .fetch(source_topic, start_offset, max_wait_ms)
         .await?;
@@ -518,10 +527,22 @@ pub async fn process_available(
     for record in &ordered_records {
         let outcome = handle_one(pool, producer, source_topic, record).await?;
         match outcome {
-            HandleOutcome::Applied => summary.applied += 1,
-            HandleOutcome::Duplicate => summary.duplicate += 1,
-            HandleOutcome::Stale => summary.stale += 1,
-            HandleOutcome::Poison => summary.poison += 1,
+            HandleOutcome::Applied => {
+                summary.applied += 1;
+                persistence::metrics::record_result("applied");
+            }
+            HandleOutcome::Duplicate => {
+                summary.duplicate += 1;
+                persistence::metrics::record_result("duplicate");
+            }
+            HandleOutcome::Stale => {
+                summary.stale += 1;
+                persistence::metrics::record_result("stale");
+            }
+            HandleOutcome::Poison => {
+                summary.poison += 1;
+                persistence::metrics::record_result("poison");
+            }
         }
 
         if fault_injector

@@ -54,7 +54,9 @@ pub async fn publish(
     ];
     producer
         .publish(&dlq_topic(source_topic), key, payload, headers)
-        .await
+        .await?;
+    crate::metrics::record_dlq();
+    Ok(())
 }
 
 #[cfg(test)]

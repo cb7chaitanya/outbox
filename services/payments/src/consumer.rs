@@ -176,6 +176,7 @@ async fn handle_authorize(
                 {
                     break;
                 }
+                persistence::metrics::record_retry();
                 let delay = persistence::outbox::full_jitter_backoff(
                     attempts_made - 1,
                     retry_config.backoff_base,
@@ -275,6 +276,7 @@ async fn handle_refund(
                 if attempts < retry_config.max_attempts
                     && started.elapsed() < retry_config.max_elapsed =>
             {
+                persistence::metrics::record_retry();
                 let delay = persistence::outbox::full_jitter_backoff(
                     attempts - 1,
                     retry_config.backoff_base,
@@ -318,7 +320,7 @@ fn build_authorized_event(
         aggregate_version: 1,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: PaymentAuthorizedPayload {
             order_id: payload.order_id,
             payment_id: payload.payment_id,
@@ -353,7 +355,7 @@ fn build_failed_event(
         aggregate_version: 1,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: PaymentFailedPayload {
             order_id: payload.order_id,
             payment_id: payload.payment_id,
@@ -387,7 +389,7 @@ fn build_refunded_event(
         aggregate_version: 2,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: PaymentRefundedPayload {
             order_id: payload.order_id,
             payment_id: payload.payment_id,
@@ -423,7 +425,7 @@ fn build_refund_failed_event(
         aggregate_version: 2,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
-        traceparent: None,
+        traceparent: envelope.traceparent.clone(),
         payload: RefundFailedPayload {
             order_id: payload.order_id,
             payment_id: payload.payment_id,
@@ -582,6 +584,7 @@ async fn handle_one(
             return Ok(HandleOutcome::Stale);
         }
         VersionDecision::Gap => {
+            persistence::metrics::record_gap();
             persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now)
                 .await?;
             tx.commit().await?;
@@ -679,6 +682,11 @@ async fn handle_one(
     persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now).await?;
     tx.commit().await?;
 
+    tracing::info!(event_id = %envelope.event_id, correlation_id = %envelope.correlation_id,
+        causation_id = %envelope.causation_id, aggregate_id = %envelope.aggregate_id,
+        aggregate_version = envelope.aggregate_version, topic = source_topic,
+        partition = SOURCE_PARTITION, offset = record.offset, result = "applied", "event handled");
+
     Ok(HandleOutcome::Applied)
 }
 
@@ -700,6 +708,9 @@ pub async fn process_available(
     let start_offset =
         persistence::inbox::fetch_offset(pool, CONSUMER_NAME, source_topic, SOURCE_PARTITION)
             .await?;
+    persistence::metrics::set_consumer_lag(
+        consumer.latest_offset(source_topic).await? - start_offset,
+    );
     let records = consumer
         .fetch(source_topic, start_offset, max_wait_ms)
         .await?;
@@ -715,10 +726,22 @@ pub async fn process_available(
         let outcome =
             handle_one(pool, producer, provider, source_topic, record, retry_config).await?;
         match outcome {
-            HandleOutcome::Applied => summary.applied += 1,
-            HandleOutcome::Duplicate => summary.duplicate += 1,
-            HandleOutcome::Stale => summary.stale += 1,
-            HandleOutcome::Poison => summary.poison += 1,
+            HandleOutcome::Applied => {
+                summary.applied += 1;
+                persistence::metrics::record_result("applied");
+            }
+            HandleOutcome::Duplicate => {
+                summary.duplicate += 1;
+                persistence::metrics::record_result("duplicate");
+            }
+            HandleOutcome::Stale => {
+                summary.stale += 1;
+                persistence::metrics::record_result("stale");
+            }
+            HandleOutcome::Poison => {
+                summary.poison += 1;
+                persistence::metrics::record_result("poison");
+            }
         }
 
         if fault_injector

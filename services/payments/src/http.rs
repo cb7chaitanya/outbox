@@ -86,6 +86,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     body.push_str(&format!(
         "outbox_lease_recoveries_total {lease_recoveries}\n"
     ));
+    body.push_str(&persistence::metrics::prometheus());
 
     (
         StatusCode::OK,

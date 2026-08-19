@@ -8,6 +8,7 @@
 
 pub mod dlq;
 pub mod inbox;
+pub mod metrics;
 pub mod outbox;
 
 pub const OUTBOX_TABLE: &str = "outbox_events";
