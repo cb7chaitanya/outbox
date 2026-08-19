@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use orders::config::DeliveryMode;
 use orders::http::AppState;
+use persistence::outbox::PublishMetrics;
 use sqlx::PgPool;
 use test_support::FaultInjector;
 
@@ -25,6 +26,7 @@ pub fn noop_state(pool: PgPool) -> AppState {
         delivery_mode: DeliveryMode::Naive,
         failure_injection_enabled: false,
         failure_injection_token: String::new(),
+        publish_metrics: Arc::new(PublishMetrics::default()),
     }
 }
 
@@ -35,16 +37,24 @@ pub fn noop_state(pool: PgPool) -> AppState {
 pub const TEST_TOKEN: &str = "integration-test-token";
 
 pub async fn live_state(pool: PgPool) -> AppState {
+    live_state_with_mode(pool, DeliveryMode::Naive).await
+}
+
+/// Same as [`live_state`] but with an explicit delivery mode, for the
+/// outbox-mode tests (spec M03) that need `DeliveryMode::Outbox` instead of
+/// the M02-era default.
+pub async fn live_state_with_mode(pool: PgPool, delivery_mode: DeliveryMode) -> AppState {
     let broker = std::env::var("REDPANDA_BROKER").unwrap_or_else(|_| "localhost:19092".to_string());
     let producer = messaging::RskafkaProducer::connect(vec![broker])
         .await
-        .expect("connect to redpanda for dual-write demonstration test");
+        .expect("connect to redpanda for integration test");
     AppState {
         pool,
         producer: Arc::new(producer),
         fault_injector: Arc::new(FaultInjector::new()),
-        delivery_mode: DeliveryMode::Naive,
+        delivery_mode,
         failure_injection_enabled: true,
         failure_injection_token: TEST_TOKEN.to_string(),
+        publish_metrics: Arc::new(PublishMetrics::default()),
     }
 }
