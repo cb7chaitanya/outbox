@@ -15,6 +15,9 @@ use rskafka::record::Record;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+pub mod consumer;
+pub use consumer::{Consumer, ConsumedRecord, NoopConsumer, RskafkaConsumer};
+
 #[derive(Debug, Error)]
 pub enum MessagingError {
     #[error("not yet implemented: {0}")]
