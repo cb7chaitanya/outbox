@@ -65,6 +65,15 @@ async fn main() -> anyhow::Result<()> {
         config.consumer_max_wait_ms,
         config.consumer_poll_interval_ms,
     );
+    let fulfilment_outcome_consumer_handle = spawn_outcome_consumer_loop(
+        pool.clone(),
+        Arc::clone(&consumer),
+        Arc::clone(&producer),
+        Arc::clone(&fault_injector),
+        contracts::fulfilment::FULFILMENT_EVENTS_TOPIC,
+        config.consumer_max_wait_ms,
+        config.consumer_poll_interval_ms,
+    );
 
     let state = AppState {
         pool,
@@ -86,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     publisher_handle.abort();
     inventory_outcome_consumer_handle.abort();
     payment_outcome_consumer_handle.abort();
+    fulfilment_outcome_consumer_handle.abort();
 
     Ok(())
 }

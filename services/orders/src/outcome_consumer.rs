@@ -37,19 +37,34 @@
 
 use chrono::Utc;
 use contracts::Envelope;
+use contracts::fulfilment::{
+    CREATE_FULFILMENT_AGGREGATE_TYPE, CREATE_FULFILMENT_COMMAND_TYPE,
+    CREATE_FULFILMENT_SCHEMA_VERSION, CreateFulfilmentPayload, FULFILMENT_COMMANDS_TOPIC,
+    FULFILMENT_CREATED_EVENT_TYPE, FULFILMENT_CREATED_SCHEMA_VERSION, FULFILMENT_FAILED_EVENT_TYPE,
+    FULFILMENT_FAILED_SCHEMA_VERSION, FulfilmentCreatedPayload, FulfilmentFailedPayload,
+};
 use contracts::inventory::{
     INVENTORY_COMMANDS_TOPIC, INVENTORY_RELEASED_EVENT_TYPE, INVENTORY_RELEASED_SCHEMA_VERSION,
-    InventoryReleasedPayload, RELEASE_INVENTORY_AGGREGATE_TYPE, RELEASE_INVENTORY_COMMAND_TYPE,
+    InventoryReleasedPayload, RELEASE_FAILED_EVENT_TYPE, RELEASE_FAILED_SCHEMA_VERSION,
+    RELEASE_INVENTORY_AGGREGATE_TYPE, RELEASE_INVENTORY_COMMAND_TYPE,
     RELEASE_INVENTORY_SCHEMA_VERSION, RESERVATION_FAILED_EVENT_TYPE,
     RESERVATION_FAILED_SCHEMA_VERSION, RESERVATION_SUCCEEDED_EVENT_TYPE,
-    RESERVATION_SUCCEEDED_SCHEMA_VERSION, ReleaseInventoryPayload, ReservationFailedPayload,
-    ReservationSucceededPayload,
+    RESERVATION_SUCCEEDED_SCHEMA_VERSION, ReleaseFailedPayload, ReleaseInventoryPayload,
+    ReservationFailedPayload, ReservationSucceededPayload,
+};
+use contracts::orders::{
+    ORDER_AGGREGATE_TYPE, ORDER_CANCELLED_EVENT_TYPE, ORDER_CANCELLED_SCHEMA_VERSION,
+    ORDER_COMPLETED_EVENT_TYPE, ORDER_COMPLETED_SCHEMA_VERSION, ORDER_CREATED_TOPIC,
+    OrderCancelledPayload, OrderCompletedPayload,
 };
 use contracts::payments::{
     AUTHORIZE_PAYMENT_COMMAND_TYPE, AUTHORIZE_PAYMENT_SCHEMA_VERSION, AuthorizePaymentPayload,
     PAYMENT_AUTHORIZED_EVENT_TYPE, PAYMENT_AUTHORIZED_SCHEMA_VERSION,
     PAYMENT_COMMAND_AGGREGATE_TYPE, PAYMENT_FAILED_EVENT_TYPE, PAYMENT_FAILED_SCHEMA_VERSION,
-    PAYMENTS_COMMANDS_TOPIC, PaymentAmount, PaymentAuthorizedPayload, PaymentFailedPayload,
+    PAYMENT_REFUNDED_EVENT_TYPE, PAYMENT_REFUNDED_SCHEMA_VERSION, PAYMENTS_COMMANDS_TOPIC,
+    PaymentAmount, PaymentAuthorizedPayload, PaymentFailedPayload, PaymentRefundedPayload,
+    REFUND_FAILED_EVENT_TYPE, REFUND_FAILED_SCHEMA_VERSION, REFUND_PAYMENT_COMMAND_TYPE,
+    REFUND_PAYMENT_SCHEMA_VERSION, RefundFailedPayload, RefundPaymentPayload,
 };
 use messaging::{ConsumedRecord, Consumer, Producer};
 use persistence::dlq::DlqRecord;
@@ -197,6 +212,150 @@ fn build_release_inventory_event(
     }
 }
 
+fn build_create_fulfilment_event(
+    envelope: &Envelope<serde_json::Value>,
+    order_id: Uuid,
+    reservation_id: Uuid,
+    payment_id: Uuid,
+    command_version: i64,
+) -> NewOutboxEvent {
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: CREATE_FULFILMENT_COMMAND_TYPE.to_string(),
+        schema_version: CREATE_FULFILMENT_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: "orders".to_string(),
+        aggregate_type: CREATE_FULFILMENT_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: CreateFulfilmentPayload {
+            order_id,
+            reservation_id,
+            payment_id,
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: CREATE_FULFILMENT_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        topic: FULFILMENT_COMMANDS_TOPIC.to_string(),
+        message_key: order_id.to_string(),
+        envelope: serde_json::to_value(inner).expect("serializes"),
+    }
+}
+
+fn build_refund_payment_event(
+    envelope: &Envelope<serde_json::Value>,
+    order_id: Uuid,
+    payment_id: Uuid,
+    command_version: i64,
+    reason: &str,
+) -> NewOutboxEvent {
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: REFUND_PAYMENT_COMMAND_TYPE.to_string(),
+        schema_version: REFUND_PAYMENT_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: "orders".to_string(),
+        aggregate_type: PAYMENT_COMMAND_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: RefundPaymentPayload {
+            order_id,
+            payment_id,
+            reason: reason.to_string(),
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: PAYMENT_COMMAND_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        topic: PAYMENTS_COMMANDS_TOPIC.to_string(),
+        message_key: order_id.to_string(),
+        envelope: serde_json::to_value(inner).expect("serializes"),
+    }
+}
+
+fn build_completed_event(
+    envelope: &Envelope<serde_json::Value>,
+    order_id: Uuid,
+    fulfilment_id: Uuid,
+    order_version: i64,
+) -> NewOutboxEvent {
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: ORDER_COMPLETED_EVENT_TYPE.to_string(),
+        schema_version: ORDER_COMPLETED_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: "orders".into(),
+        aggregate_type: ORDER_AGGREGATE_TYPE.into(),
+        aggregate_id: order_id,
+        aggregate_version: order_version,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: OrderCompletedPayload {
+            order_id,
+            fulfilment_id,
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: ORDER_AGGREGATE_TYPE.into(),
+        aggregate_id: order_id,
+        aggregate_version: order_version,
+        topic: ORDER_CREATED_TOPIC.into(),
+        message_key: order_id.to_string(),
+        envelope: serde_json::to_value(inner).expect("serializes"),
+    }
+}
+
+fn build_cancelled_event(
+    envelope: &Envelope<serde_json::Value>,
+    order_id: Uuid,
+    order_version: i64,
+    reason: &str,
+) -> NewOutboxEvent {
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: ORDER_CANCELLED_EVENT_TYPE.to_string(),
+        schema_version: ORDER_CANCELLED_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: "orders".into(),
+        aggregate_type: ORDER_AGGREGATE_TYPE.into(),
+        aggregate_id: order_id,
+        aggregate_version: order_version,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: OrderCancelledPayload {
+            order_id,
+            reason_code: reason.to_string(),
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: ORDER_AGGREGATE_TYPE.into(),
+        aggregate_id: order_id,
+        aggregate_version: order_version,
+        topic: ORDER_CREATED_TOPIC.into(),
+        message_key: order_id.to_string(),
+        envelope: serde_json::to_value(inner).expect("serializes"),
+    }
+}
+
 /// A redelivery-shaped race (this event reprocessed after the order
 /// already advanced past the status this transition requires through some
 /// other path) is not this consumer's job to force through, and not a
@@ -266,8 +425,13 @@ async fn handle_one(
         RESERVATION_SUCCEEDED_EVENT_TYPE => RESERVATION_SUCCEEDED_SCHEMA_VERSION,
         RESERVATION_FAILED_EVENT_TYPE => RESERVATION_FAILED_SCHEMA_VERSION,
         INVENTORY_RELEASED_EVENT_TYPE => INVENTORY_RELEASED_SCHEMA_VERSION,
+        RELEASE_FAILED_EVENT_TYPE => RELEASE_FAILED_SCHEMA_VERSION,
         PAYMENT_AUTHORIZED_EVENT_TYPE => PAYMENT_AUTHORIZED_SCHEMA_VERSION,
         PAYMENT_FAILED_EVENT_TYPE => PAYMENT_FAILED_SCHEMA_VERSION,
+        PAYMENT_REFUNDED_EVENT_TYPE => PAYMENT_REFUNDED_SCHEMA_VERSION,
+        REFUND_FAILED_EVENT_TYPE => REFUND_FAILED_SCHEMA_VERSION,
+        FULFILMENT_CREATED_EVENT_TYPE => FULFILMENT_CREATED_SCHEMA_VERSION,
+        FULFILMENT_FAILED_EVENT_TYPE => FULFILMENT_FAILED_SCHEMA_VERSION,
         _ => {
             publish_dlq(
                 producer,
@@ -521,18 +685,39 @@ async fn handle_one(
             // confirmation is what finally lets the order become
             // CANCELLED (spec section 12: "cancel after release
             // confirmation").
-            repository::transition_order_with_outbox(
-                &mut tx,
-                payload.order_id,
-                OrderStatus::Cancelled,
-                Some("inventory release confirmed"),
-                Some(envelope.event_id),
-                None,
-                now,
-                |_, _| Vec::new(),
+            let waiting_for_refund: Option<bool> = sqlx::query_scalar(
+                "update orders set compensation_release_done = true where id = $1 \
+                 returning compensation_refund_required and not compensation_refund_done",
             )
-            .await
-            .map(|_| ())
+            .bind(payload.order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match waiting_for_refund {
+                None => Err(TransitionError::NotFound),
+                Some(true) => Ok(()),
+                Some(false) => {
+                    let terminal_envelope = envelope.clone();
+                    repository::transition_order_with_outbox(
+                        &mut tx,
+                        payload.order_id,
+                        OrderStatus::Cancelled,
+                        Some("required compensations confirmed"),
+                        Some(envelope.event_id),
+                        None,
+                        now,
+                        move |order_id, version| {
+                            vec![build_cancelled_event(
+                                &terminal_envelope,
+                                order_id,
+                                version,
+                                "COMPENSATED",
+                            )]
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            }
         }
         PAYMENT_AUTHORIZED_EVENT_TYPE => {
             let payload: PaymentAuthorizedPayload =
@@ -553,9 +738,12 @@ async fn handle_one(
                         return Ok(HandleOutcome::Poison);
                     }
                 };
-            // M06 stops here: driving READY_FOR_FULFILMENT is M07's job,
-            // once fulfilment exists to be ready *for*.
-            repository::transition_order_with_outbox(
+            sqlx::query("update orders set payment_id = $1 where id = $2")
+                .bind(payload.payment_id)
+                .bind(payload.order_id)
+                .execute(&mut *tx)
+                .await?;
+            let payment_transition = repository::transition_order_with_outbox(
                 &mut tx,
                 payload.order_id,
                 OrderStatus::PaymentAuthorized,
@@ -565,12 +753,60 @@ async fn handle_one(
                 now,
                 |_, _| Vec::new(),
             )
+            .await;
+            match payment_transition {
+                Ok(_) => {}
+                Err(TransitionError::IllegalTransition { from, to }) => {
+                    log_illegal_transition_race(payload.order_id, from, to);
+                    return finish_reaction(tx, &envelope, now).await;
+                }
+                Err(TransitionError::NotFound) => {
+                    tx.rollback().await?;
+                    publish_dlq(
+                        producer,
+                        source_topic,
+                        &key,
+                        record,
+                        Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                        "UNKNOWN_ORDER",
+                        format!("payment_authorized for unknown order {}", payload.order_id),
+                    )
+                    .await?;
+                    return Ok(HandleOutcome::Poison);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let reservation_id: Uuid =
+                sqlx::query_scalar("select reservation_id from orders where id = $1")
+                    .bind(payload.order_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let command_version =
+                repository::reserve_command_version(&mut tx, payload.order_id, "fulfilment")
+                    .await?;
+            let envelope_for_event = envelope.clone();
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::ReadyForFulfilment,
+                Some("inventory and payment confirmed"),
+                Some(envelope.event_id),
+                None,
+                now,
+                move |order_id, _| {
+                    vec![build_create_fulfilment_event(
+                        &envelope_for_event,
+                        order_id,
+                        reservation_id,
+                        payload.payment_id,
+                        command_version,
+                    )]
+                },
+            )
             .await
             .map(|_| ())
         }
-        _ => {
-            // PAYMENT_FAILED_EVENT_TYPE: the match above already rejected
-            // anything else as UNSUPPORTED_SCHEMA before reaching here.
+        PAYMENT_FAILED_EVENT_TYPE => {
             let payload: PaymentFailedPayload =
                 match serde_json::from_value(envelope.payload.clone()) {
                     Ok(p) => p,
@@ -637,6 +873,194 @@ async fn handle_one(
             .await
             .map(|_| ())
         }
+        FULFILMENT_CREATED_EVENT_TYPE => {
+            let payload: FulfilmentCreatedPayload =
+                serde_json::from_value(envelope.payload.clone())?;
+            sqlx::query("update orders set fulfilment_id = $1 where id = $2")
+                .bind(payload.fulfilment_id)
+                .bind(payload.order_id)
+                .execute(&mut *tx)
+                .await?;
+            let terminal_envelope = envelope.clone();
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::Completed,
+                Some("fulfilment created"),
+                Some(envelope.event_id),
+                None,
+                now,
+                move |order_id, version| {
+                    vec![build_completed_event(
+                        &terminal_envelope,
+                        order_id,
+                        payload.fulfilment_id,
+                        version,
+                    )]
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+        FULFILMENT_FAILED_EVENT_TYPE => {
+            let payload: FulfilmentFailedPayload =
+                serde_json::from_value(envelope.payload.clone())?;
+            let facts: Option<(Option<Uuid>, Option<Uuid>)> =
+                sqlx::query_as("select reservation_id, payment_id from orders where id = $1")
+                    .bind(payload.order_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some((Some(reservation_id), Some(payment_id))) = facts else {
+                tx.rollback().await?;
+                publish_dlq(
+                    producer,
+                    source_topic,
+                    &key,
+                    record,
+                    Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                    "UNKNOWN_ORDER",
+                    format!(
+                        "fulfilment_failed for unknown or incomplete order {}",
+                        payload.order_id
+                    ),
+                )
+                .await?;
+                return Ok(HandleOutcome::Poison);
+            };
+            sqlx::query(
+                "update orders set compensation_release_required = true, \
+                compensation_refund_required = true where id = $1",
+            )
+            .bind(payload.order_id)
+            .execute(&mut *tx)
+            .await?;
+            let inventory_version =
+                repository::reserve_command_version(&mut tx, payload.order_id, "inventory").await?;
+            let payment_version =
+                repository::reserve_command_version(&mut tx, payload.order_id, "payments").await?;
+            let envelope_for_event = envelope.clone();
+            let reason = payload.reason_code.clone();
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::Cancelling,
+                Some(&payload.reason_code),
+                Some(envelope.event_id),
+                None,
+                now,
+                move |order_id, _| {
+                    vec![
+                        build_release_inventory_event(
+                            &envelope_for_event,
+                            order_id,
+                            reservation_id,
+                            inventory_version,
+                            &reason,
+                        ),
+                        build_refund_payment_event(
+                            &envelope_for_event,
+                            order_id,
+                            payment_id,
+                            payment_version,
+                            &reason,
+                        ),
+                    ]
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+        PAYMENT_REFUNDED_EVENT_TYPE => {
+            let payload: PaymentRefundedPayload = serde_json::from_value(envelope.payload.clone())?;
+            let waiting_for_release: Option<bool> = sqlx::query_scalar(
+                "update orders set compensation_refund_done = true where id = $1 \
+                 returning compensation_release_required and not compensation_release_done",
+            )
+            .bind(payload.order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match waiting_for_release {
+                None => Err(TransitionError::NotFound),
+                Some(true) => Ok(()),
+                Some(false) => {
+                    let terminal_envelope = envelope.clone();
+                    repository::transition_order_with_outbox(
+                        &mut tx,
+                        payload.order_id,
+                        OrderStatus::Cancelled,
+                        Some("required compensations confirmed"),
+                        Some(envelope.event_id),
+                        None,
+                        now,
+                        move |order_id, version| {
+                            vec![build_cancelled_event(
+                                &terminal_envelope,
+                                order_id,
+                                version,
+                                "COMPENSATED",
+                            )]
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            }
+        }
+        RELEASE_FAILED_EVENT_TYPE => {
+            let payload: ReleaseFailedPayload = serde_json::from_value(envelope.payload.clone())?;
+            publish_dlq(
+                producer,
+                source_topic,
+                &key,
+                record,
+                Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                "COMPENSATION_EXHAUSTED",
+                payload.reason_code.clone(),
+            )
+            .await?;
+            tracing::error!(order_id = %payload.order_id, reason = %payload.reason_code,
+                "compensation exhausted; operator review required");
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::ManualReview,
+                Some(&payload.reason_code),
+                Some(envelope.event_id),
+                None,
+                now,
+                |_, _| Vec::new(),
+            )
+            .await
+            .map(|_| ())
+        }
+        REFUND_FAILED_EVENT_TYPE => {
+            let payload: RefundFailedPayload = serde_json::from_value(envelope.payload.clone())?;
+            publish_dlq(
+                producer,
+                source_topic,
+                &key,
+                record,
+                Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                "COMPENSATION_EXHAUSTED",
+                payload.reason_code.clone(),
+            )
+            .await?;
+            tracing::error!(order_id = %payload.order_id, reason = %payload.reason_code,
+                "compensation exhausted; operator review required");
+            repository::transition_order_with_outbox(
+                &mut tx,
+                payload.order_id,
+                OrderStatus::ManualReview,
+                Some(&payload.reason_code),
+                Some(envelope.event_id),
+                None,
+                now,
+                |_, _| Vec::new(),
+            )
+            .await
+            .map(|_| ())
+        }
+        _ => unreachable!("schema dispatch rejected unsupported type"),
     };
 
     match outcome_result {
@@ -682,6 +1106,23 @@ async fn handle_one(
     persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now).await?;
     tx.commit().await?;
 
+    Ok(HandleOutcome::Applied)
+}
+
+async fn finish_reaction(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    envelope: &Envelope<serde_json::Value>,
+    now: chrono::DateTime<Utc>,
+) -> Result<HandleOutcome, anyhow::Error> {
+    persistence::inbox::advance_version(
+        &mut tx,
+        CONSUMER_NAME,
+        envelope.aggregate_id,
+        envelope.aggregate_version,
+    )
+    .await?;
+    persistence::inbox::mark_processed(&mut tx, CONSUMER_NAME, envelope.event_id, now).await?;
+    tx.commit().await?;
     Ok(HandleOutcome::Applied)
 }
 
