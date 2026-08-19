@@ -196,3 +196,92 @@ pub async fn reserve(
         created: true,
     })
 }
+
+#[derive(Debug, Clone)]
+pub struct ReleaseOutcome {
+    pub reservation_id: Uuid,
+    /// `true` only when this call actually released stock (the reservation
+    /// was `ACTIVE`); `false` for a redelivered/duplicate release request
+    /// against an already-`RELEASED` reservation, or a defensive no-op
+    /// against a `REJECTED`/`COMMITTED` one (neither has active stock to
+    /// give back — `REJECTED` reservations are compensation matrix row 1's
+    /// job, which never emits a release command in the first place, and
+    /// `COMMITTED` is unreachable before fulfilment exists in M07). The
+    /// caller uses this to decide whether to emit `inventory_released`
+    /// (spec section 12: "Releasing an already released reservation...
+    /// return[s] logical success without repeating the effect").
+    pub created: bool,
+}
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseError {
+    #[error("no reservation found for order {0}")]
+    NotFound(Uuid),
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+}
+
+/// Releases every SKU held by `order_id`'s reservation, restoring
+/// `available_qty`/`reserved_qty` (invariant I5), locking stock rows in the
+/// same sorted-SKU order as [`reserve`] to avoid deadlocking against a
+/// concurrent reservation on an overlapping SKU set.
+///
+/// Takes an already-open transaction connection for the same reason
+/// [`reserve`] does: the caller applies this mutation and its resulting
+/// outbox event, inbox mark, and consumer-version advance in one
+/// transaction (spec section 14 steps 4-6).
+pub async fn release(
+    conn: &mut PgConnection,
+    order_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<ReleaseOutcome, ReleaseError> {
+    let reservation = sqlx::query_as::<_, ReservationRow>(
+        "select id, order_id, status, reason_code, version, created_at, updated_at \
+         from reservations where order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(ReleaseError::NotFound(order_id))?;
+
+    if reservation.status != ReservationStatus::Active {
+        // Idempotent replay (already RELEASED) or a defensive no-op
+        // (REJECTED/COMMITTED never had stock reserved to give back).
+        return Ok(ReleaseOutcome {
+            reservation_id: reservation.id,
+            created: false,
+        });
+    }
+
+    let items = sqlx::query_as::<_, (String, i64)>(
+        "select sku, quantity from reservation_items where reservation_id = $1 order by sku",
+    )
+    .bind(reservation.id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for (sku, quantity) in &items {
+        sqlx::query(
+            "update stock set available_qty = available_qty + $1, reserved_qty = reserved_qty - $1, \
+             version = version + 1, updated_at = $3 where sku = $2",
+        )
+        .bind(quantity)
+        .bind(sku)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    sqlx::query(
+        "update reservations set status = 'RELEASED', version = version + 1, updated_at = $2 \
+         where id = $1",
+    )
+    .bind(reservation.id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(ReleaseOutcome {
+        reservation_id: reservation.id,
+        created: true,
+    })
+}
