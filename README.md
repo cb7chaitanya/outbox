@@ -8,17 +8,21 @@ optional saga orchestrator — until the same failures are handled
 correctly. See `PROJECT_2_SPEC.md` for the full contract this repository
 implements, milestone by milestone.
 
-## What's built so far (M00-M02)
+## What's built so far (M00-M03)
 
 Workspace scaffolding (M00), the orders service's local-consistency core
 (M01: idempotent order creation, versioned state machine, transition
-history), and the naive dual-write stage plus its failure lab (M02):
-`orders` now publishes `orders.order_created` directly to Kafka right
-after its DB commit — deliberately with no coordination between the two —
-and ships deterministic fault injection that reproduces both resulting
-atomicity gaps on demand. Inventory, payments, and fulfilment remain
-health-endpoint skeletons; no outbox exists yet (M03). Track progress in
-[`docs/progress.md`](docs/progress.md).
+history), the naive dual-write stage plus its failure lab (M02), and the
+transactional outbox that replaces it as the default (M03): `orders` now
+inserts a business mutation and its outbox event in one database
+transaction, and a background publisher worker claims rows with
+`FOR UPDATE SKIP LOCKED` leases and publishes them independently of the
+request path, retrying with full-jitter backoff on failure. The naive
+publish path from M02 stays runnable behind `DELIVERY_MODE=naive` so its
+failure lab remains reproducible; `DELIVERY_MODE=outbox` is now the
+default and closes the lost-event window the naive path has. Inventory,
+payments, and fulfilment remain health-endpoint skeletons (M04+). Track
+progress in [`docs/progress.md`](docs/progress.md).
 
 ## Architecture
 
@@ -136,11 +140,10 @@ credentials in `.env`.
 Idempotency and correlation-ID handling are implemented for order
 creation (M01, see the curl example above and `docs/evidence/m01.md`).
 
-**Naive dual-write lab (M02):** with `DELIVERY_MODE=naive` (the current
-default — `outbox` parses but has no implementation until M03), every
-accepted `POST /v1/orders` call commits the order in Postgres and then
-publishes `orders.order_created` directly to Kafka, with nothing tying
-the two together. Run
+**Naive dual-write lab (M02):** with `DELIVERY_MODE=naive` (opt-in since
+M03 — `outbox` is now the default), every accepted `POST /v1/orders` call
+commits the order in Postgres and then publishes `orders.order_created`
+directly to Kafka, with nothing tying the two together. Run
 
 ```sh
 make demo-naive-failure
@@ -157,9 +160,26 @@ of why retries cannot close either gap: [`docs/failure-lab.md`](docs/failure-lab
 Deterministic, automated versions of the same two demonstrations:
 `services/orders/tests/dual_write_tests.rs`.
 
-Transactional-outbox recovery demo (M03) is not implemented yet — this
-section grows as each milestone completes; see `docs/progress.md` for
-current status and `PROJECT_2_SPEC.md` sections 11–14 for what's coming.
+**Transactional outbox (M03):** with `DELIVERY_MODE=outbox` (the
+default), order creation inserts the order row and its
+`orders.order_created` outbox row in one database transaction (spec
+section 13) — the event can never be lost the way the naive path loses
+it in gap 1, because there is no window between "the business change
+committed" and "the event is durably recorded" for a fault to land in.
+A background publisher worker independently claims unpublished rows
+with `FOR UPDATE SKIP LOCKED` and a lease, publishes them, and retries
+with full-jitter backoff on failure; a worker that dies between a
+successful publish and marking the row published causes the row to be
+republished once its lease expires — a legitimate at-least-once
+duplicate, not a lost event. Deterministic, automated demonstrations of
+all six M03 acceptance gates (atomic rollback, exactly-one-outbox-row,
+crash-then-duplicate-then-published, two publishers sharing a backlog
+without double-publishing, broker-outage backlog growth and drain, and
+the closed lost-event window): `services/orders/tests/outbox_tests.rs`.
+Backlog/publish/lease-recovery counters: `GET /metrics` on the orders
+service. This section grows as later milestones (inventory/payments/
+fulfilment consumers, M04+) land; see `docs/progress.md` for current
+status.
 
 ## Delivery semantics
 
@@ -221,16 +241,21 @@ When enabled, `orders` mounts `PUT /_test/faults/{name}` and
 
 ## Known limitations
 
-- M00-M02 only: `orders` publishes directly to Kafka after its own DB
-  commit (naive dual write, no outbox/inbox tables yet — those land in
-  M03/M04) and nothing else consumes those events yet.
+- M00-M03 only: `orders` has a transactional outbox and a publisher
+  worker, but nothing else consumes `orders.order_created` yet — no
+  inbox/idempotent-consumer pattern exists until M04.
   Inventory/payments/fulfilment remain health-endpoint skeletons with no
   persistence wiring, so their `/health/ready` doesn't check a dependency
   yet (orders' does).
-- The naive publish path republishes on every accepted create call,
-  including idempotent replays — a deliberate, documented anti-pattern
-  (`docs/adr/0003-naive-publish-on-every-replay.md`), not a bug to fix
-  before M03.
+- The naive publish path (still runnable behind `DELIVERY_MODE=naive`)
+  republishes on every accepted create call, including idempotent
+  replays — a deliberate, documented anti-pattern
+  (`docs/adr/0003-naive-publish-on-every-replay.md`), not a bug; the
+  outbox mode fixes this by only inserting an outbox row when a new
+  order is genuinely created.
+- The outbox publisher's retry backoff uses an unseeded RNG for M03
+  (full-jitter per spec section 15); deterministic/seeded retry timing
+  for tests is deferred to M05's full retry-taxonomy milestone.
 - `POST /v1/orders/{id}/cancel` does not exist yet — it is optional per
   spec section 10 and deferred until the choreographed workflow (M06+)
   gives it something meaningful to cancel.
