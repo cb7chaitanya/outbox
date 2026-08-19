@@ -13,8 +13,10 @@ use tokio::sync::{Mutex, MutexGuard};
 use chrono::Utc;
 use contracts::Envelope;
 use contracts::inventory::{
-    RESERVE_INVENTORY_AGGREGATE_TYPE, RESERVE_INVENTORY_COMMAND_TYPE,
-    RESERVE_INVENTORY_SCHEMA_VERSION, ReserveInventoryItem, ReserveInventoryPayload,
+    RELEASE_INVENTORY_AGGREGATE_TYPE, RELEASE_INVENTORY_COMMAND_TYPE,
+    RELEASE_INVENTORY_SCHEMA_VERSION, RESERVE_INVENTORY_AGGREGATE_TYPE,
+    RESERVE_INVENTORY_COMMAND_TYPE, RESERVE_INVENTORY_SCHEMA_VERSION, ReleaseInventoryPayload,
+    ReserveInventoryItem, ReserveInventoryPayload,
 };
 use inventory::consumer::{CONSUMER_NAME, ProcessSummary, SOURCE_PARTITION};
 use messaging::{Consumer, Producer, RskafkaConsumer, RskafkaProducer};
@@ -124,6 +126,96 @@ pub async fn publish_reserve_command(
     let (event_id, bytes) = build_reserve_envelope(order_id, order_version, items, correlation_id);
     publish_raw(producer, topic, &order_id.to_string(), bytes).await;
     event_id
+}
+
+/// Builds a real `inventory.release_inventory` envelope (not published).
+/// `command_version` mirrors what orders' real per-`(order_id,
+/// "inventory")` counter would assign (spec section 14; see
+/// `docs/adr/0011-per-target-command-version-counter.md`) — tests pass it
+/// explicitly since they publish directly rather than going through orders.
+pub fn build_release_envelope(
+    order_id: Uuid,
+    reservation_id: Uuid,
+    command_version: i64,
+    reason: &str,
+    correlation_id: Uuid,
+) -> (Uuid, Vec<u8>) {
+    let event_id = Uuid::now_v7();
+    let envelope = Envelope {
+        event_id,
+        event_type: RELEASE_INVENTORY_COMMAND_TYPE.to_string(),
+        schema_version: RELEASE_INVENTORY_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: "orders".to_string(),
+        aggregate_type: RELEASE_INVENTORY_AGGREGATE_TYPE.to_string(),
+        aggregate_id: order_id,
+        aggregate_version: command_version,
+        correlation_id,
+        causation_id: Uuid::now_v7(),
+        traceparent: None,
+        payload: ReleaseInventoryPayload {
+            order_id,
+            reservation_id,
+            reason: reason.to_string(),
+        },
+    };
+    let bytes = serde_json::to_vec(&envelope).expect("envelope serializes");
+    (event_id, bytes)
+}
+
+/// Publishes whatever is currently sitting unpublished in this test's own
+/// `outbox_events` table. Tests here call `inventory::consumer` functions
+/// directly rather than running the real `inventory` binary, so nothing
+/// else drains that table onto the real broker (that's normally
+/// `persistence::outbox::spawn_publisher_loop`, started in `main.rs`).
+pub async fn drain_outbox(pool: &PgPool, producer: &dyn Producer) {
+    let fault_injector = FaultInjector::new();
+    let metrics = persistence::outbox::PublishMetrics::default();
+    loop {
+        let claimed = persistence::outbox::run_publisher_once(
+            pool,
+            producer,
+            &fault_injector,
+            &persistence::outbox::PublisherConfig::default(),
+            &metrics,
+            Utc::now(),
+        )
+        .await
+        .expect("run_publisher_once");
+        if claimed == 0 {
+            return;
+        }
+    }
+}
+
+/// Reads every record on `topic` from `from_offset` to the current high
+/// watermark whose Kafka message key and envelope `event_type` both match,
+/// deserialized as raw JSON. Callers must pass a `from_offset` captured
+/// (via [`Consumer::latest_offset`]) before publishing whatever they're
+/// looking for — starting from `0` on this project's long-lived shared dev
+/// topics would need a batch far larger than `RskafkaConsumer::fetch`'s 1
+/// MiB window to ever reach recent records.
+pub async fn matching_events_for_key(
+    consumer: &dyn Consumer,
+    topic: &str,
+    from_offset: i64,
+    key: &str,
+    event_type: &str,
+) -> Vec<serde_json::Value> {
+    let records = consumer
+        .fetch(topic, from_offset, 1_000)
+        .await
+        .expect("fetch records from from_offset");
+    records
+        .into_iter()
+        .filter(|r| r.key.as_deref() == Some(key.as_bytes()))
+        .filter_map(|r| {
+            let value = r.value?;
+            let envelope: serde_json::Value = serde_json::from_slice(&value).ok()?;
+            (envelope.get("event_type").and_then(|v| v.as_str()) == Some(event_type))
+                .then_some(envelope)
+        })
+        .collect()
 }
 
 /// Publishes a raw, non-envelope payload, for poison-message tests.

@@ -13,11 +13,13 @@
 use chrono::Utc;
 use contracts::Envelope;
 use contracts::inventory::{
-    INVENTORY_PRODUCER_NAME, RESERVATION_AGGREGATE_TYPE, RESERVATION_FAILED_EVENT_TYPE,
-    RESERVATION_FAILED_SCHEMA_VERSION, RESERVATION_SUCCEEDED_EVENT_TYPE,
-    RESERVATION_SUCCEEDED_SCHEMA_VERSION, RESERVE_INVENTORY_COMMAND_TYPE,
-    RESERVE_INVENTORY_SCHEMA_VERSION, ReservationFailedPayload, ReservationSucceededPayload,
-    ReserveInventoryItem, ReserveInventoryPayload,
+    INVENTORY_PRODUCER_NAME, INVENTORY_RELEASED_EVENT_TYPE, INVENTORY_RELEASED_SCHEMA_VERSION,
+    InventoryReleasedPayload, RELEASE_INVENTORY_COMMAND_TYPE, RELEASE_INVENTORY_SCHEMA_VERSION,
+    RESERVATION_AGGREGATE_TYPE, RESERVATION_FAILED_EVENT_TYPE, RESERVATION_FAILED_SCHEMA_VERSION,
+    RESERVATION_SUCCEEDED_EVENT_TYPE, RESERVATION_SUCCEEDED_SCHEMA_VERSION,
+    RESERVE_INVENTORY_COMMAND_TYPE, RESERVE_INVENTORY_SCHEMA_VERSION, ReleaseInventoryPayload,
+    ReservationFailedPayload, ReservationSucceededPayload, ReserveInventoryItem,
+    ReserveInventoryPayload,
 };
 use messaging::{ConsumedRecord, Consumer, Producer};
 use persistence::dlq::DlqRecord;
@@ -149,9 +151,24 @@ async fn handle_one(
         }
     };
 
-    if envelope.event_type != RESERVE_INVENTORY_COMMAND_TYPE
-        || envelope.schema_version != RESERVE_INVENTORY_SCHEMA_VERSION
-    {
+    let expected_schema_version = match envelope.event_type.as_str() {
+        RESERVE_INVENTORY_COMMAND_TYPE => RESERVE_INVENTORY_SCHEMA_VERSION,
+        RELEASE_INVENTORY_COMMAND_TYPE => RELEASE_INVENTORY_SCHEMA_VERSION,
+        _ => {
+            publish_dlq(
+                producer,
+                source_topic,
+                &key,
+                record,
+                Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                "UNSUPPORTED_SCHEMA",
+                format!("unknown event type {}", envelope.event_type),
+            )
+            .await?;
+            return Ok(HandleOutcome::Poison);
+        }
+    };
+    if envelope.schema_version != expected_schema_version {
         publish_dlq(
             producer,
             source_topic,
@@ -167,23 +184,6 @@ async fn handle_one(
         .await?;
         return Ok(HandleOutcome::Poison);
     }
-
-    let payload: ReserveInventoryPayload = match serde_json::from_value(envelope.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            publish_dlq(
-                producer,
-                source_topic,
-                &key,
-                record,
-                Some(serde_json::to_value(&envelope).unwrap_or_default()),
-                "MALFORMED_PAYLOAD",
-                format!("payload did not match reserve_inventory shape: {e}"),
-            )
-            .await?;
-            return Ok(HandleOutcome::Poison);
-        }
-    };
 
     let hash = payload_hash(&envelope.payload);
     let now = Utc::now();
@@ -267,35 +267,90 @@ async fn handle_one(
         VersionDecision::Apply => {}
     }
 
-    // Step 5: apply the business mutation.
-    let raw_items: Vec<(String, i64)> = payload
-        .items
-        .iter()
-        .map(|i| (i.sku.clone(), i.quantity))
-        .collect();
-    let lines = match domain::validate_items(&raw_items) {
-        Ok(lines) => lines,
-        Err(e) => {
-            tx.rollback().await?;
-            publish_dlq(
-                producer,
-                source_topic,
-                &key,
-                record,
-                Some(serde_json::to_value(&envelope).unwrap_or_default()),
-                "INVALID_RESERVATION_REQUEST",
-                e.to_string(),
-            )
-            .await?;
-            return Ok(HandleOutcome::Poison);
+    // Step 5: apply the business mutation, dispatching on event_type since
+    // both commands share `inventory.commands.v1`.
+    let outbox_events: Vec<NewOutboxEvent> = if envelope.event_type
+        == RESERVE_INVENTORY_COMMAND_TYPE
+    {
+        let payload: ReserveInventoryPayload =
+            match serde_json::from_value(envelope.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tx.rollback().await?;
+                    publish_dlq(
+                        producer,
+                        source_topic,
+                        &key,
+                        record,
+                        Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                        "MALFORMED_PAYLOAD",
+                        format!("payload did not match reserve_inventory shape: {e}"),
+                    )
+                    .await?;
+                    return Ok(HandleOutcome::Poison);
+                }
+            };
+        let raw_items: Vec<(String, i64)> = payload
+            .items
+            .iter()
+            .map(|i| (i.sku.clone(), i.quantity))
+            .collect();
+        let lines = match domain::validate_items(&raw_items) {
+            Ok(lines) => lines,
+            Err(e) => {
+                tx.rollback().await?;
+                publish_dlq(
+                    producer,
+                    source_topic,
+                    &key,
+                    record,
+                    Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                    "INVALID_RESERVATION_REQUEST",
+                    e.to_string(),
+                )
+                .await?;
+                return Ok(HandleOutcome::Poison);
+            }
+        };
+        let outcome = crate::repository::reserve(&mut tx, payload.order_id, &lines, now).await?;
+        vec![build_reservation_outcome_event(
+            &envelope, &payload, &outcome,
+        )]
+    } else {
+        let payload: ReleaseInventoryPayload =
+            match serde_json::from_value(envelope.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tx.rollback().await?;
+                    publish_dlq(
+                        producer,
+                        source_topic,
+                        &key,
+                        record,
+                        Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                        "MALFORMED_PAYLOAD",
+                        format!("payload did not match release_inventory shape: {e}"),
+                    )
+                    .await?;
+                    return Ok(HandleOutcome::Poison);
+                }
+            };
+        let outcome = crate::repository::release(&mut tx, payload.order_id, now).await?;
+        if outcome.created {
+            vec![build_released_event(
+                &envelope,
+                &payload,
+                outcome.reservation_id,
+            )]
+        } else {
+            Vec::new()
         }
     };
 
-    let outcome = crate::repository::reserve(&mut tx, payload.order_id, &lines, now).await?;
-
-    // Step 6: insert the resulting outbox event, in the same transaction.
-    let outbox_event = build_outcome_event(&envelope, &payload, &outcome);
-    persistence::outbox::insert(&mut tx, now, &outbox_event).await?;
+    // Step 6: insert the resulting outbox event(s), in the same transaction.
+    for outbox_event in outbox_events {
+        persistence::outbox::insert(&mut tx, now, &outbox_event).await?;
+    }
 
     persistence::inbox::advance_version(
         &mut tx,
@@ -312,7 +367,7 @@ async fn handle_one(
     Ok(HandleOutcome::Applied)
 }
 
-fn build_outcome_event(
+fn build_reservation_outcome_event(
     envelope: &Envelope<serde_json::Value>,
     payload: &ReserveInventoryPayload,
     outcome: &crate::repository::ReserveOutcome,
@@ -390,6 +445,47 @@ fn build_outcome_event(
                 envelope: serde_json::to_value(&failed).expect("envelope serializes"),
             }
         }
+    }
+}
+
+/// `aggregate_version: 2` — the reservation aggregate's outbox-emitting
+/// lifecycle is fixed and known ahead of time (unlike orders' open-ended
+/// outbound command relationships): version 1 is always
+/// `reservation_succeeded`/`reservation_failed`, and `inventory_released`
+/// (only ever emitted for a reservation that *was* active, per
+/// [`crate::repository::release`]'s `created` guard) is always the second
+/// and last event on that same aggregate.
+fn build_released_event(
+    envelope: &Envelope<serde_json::Value>,
+    payload: &ReleaseInventoryPayload,
+    reservation_id: Uuid,
+) -> NewOutboxEvent {
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: INVENTORY_RELEASED_EVENT_TYPE.to_string(),
+        schema_version: INVENTORY_RELEASED_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: INVENTORY_PRODUCER_NAME.to_string(),
+        aggregate_type: RESERVATION_AGGREGATE_TYPE.to_string(),
+        aggregate_id: reservation_id,
+        aggregate_version: 2,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: InventoryReleasedPayload {
+            order_id: payload.order_id,
+            reservation_id,
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: RESERVATION_AGGREGATE_TYPE.to_string(),
+        aggregate_id: reservation_id,
+        aggregate_version: 2,
+        topic: contracts::inventory::INVENTORY_EVENTS_TOPIC.to_string(),
+        message_key: payload.order_id.to_string(),
+        envelope: serde_json::to_value(&inner).expect("envelope serializes"),
     }
 }
 
