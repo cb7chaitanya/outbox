@@ -6,6 +6,11 @@ first only inverted the inconsistency; retrying an ambiguous response created
 a duplicate. Two independently committed systems do not become atomic because
 the caller retries harder.
 
+The failure lab captures both windows. A fault after the database commit leaves
+an accepted order with no event. A fault after publish but before the response
+makes the retry publish a second event, even though the idempotency key prevents
+a second order row. `make demo-naive-failure` reproduces both outcomes.
+
 The transactional outbox moved the boundary. Business state and serialized
 events commit locally together. A leased publisher may crash and republish, so
 delivery remains at least once. Reliability comes from idempotent effects.
@@ -43,6 +48,12 @@ The result is not magical exactly-once delivery. It is at-least-once transport,
 atomic local changes, and effectively-once business effects backed by tests,
 fault injection, and a runbook.
 
+Choreography fits this project because each service reacts to facts it owns and
+the workflow remains small. An orchestrator could make a much larger workflow's
+control flow and timeouts easier to see, at the cost of a central coordinator
+coupled to every participant. That optional M11 comparison is planned, not part
+of the completed core implementation.
+
 ## Interview prompts
 
 - Why can neither ordering of DB write and broker publish close dual-write?
@@ -51,3 +62,6 @@ fault injection, and a runbook.
 - Why is cancellation unsafe before compensation acknowledgements?
 - How does contiguous offset tracking make reordered handling crash-safe?
 - When would orchestration be preferable, and what coupling would it add?
+- Draw both dual-write failure timelines and identify every durable boundary.
+- Propose production extensions for provider reconciliation, multi-partition
+  scaling, schema governance, retention, authentication, and disaster recovery.

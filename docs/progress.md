@@ -12,12 +12,13 @@
 - [x] M07 — Fulfilment and complete compensation matrix
 - [x] M08 — Ordering, replay, and concurrency hardening
 - [x] M09 — Observability, chaos, and operations
-- [ ] M10 — Final acceptance, README, and learning write-up
+- [x] M10 — Final acceptance, README, and learning write-up
 - [ ] M11 — Optional saga orchestrator (only after M10)
 
 ## Current milestone
 
-M09 complete. Next action: M10 — final acceptance and learning guide.
+Required M00–M10 complete. Optional M11 is intentionally not implemented.
+Final acceptance evidence: [`docs/evidence/final.md`](evidence/final.md).
 
 ## Decisions
 

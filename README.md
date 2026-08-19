@@ -132,5 +132,5 @@ ledger and one active consumer per partition. Topics are single-partition for
 deterministic learning, not maximum throughput. Choreography is the required
 default; the M11 orchestrator is optional after core completion.
 
-Read [the learning write-up](docs/blog.md), [ADRs](docs/adr), and
+Read [the learning write-up](docs/blog/project-2-event-driven-orders.md), [ADRs](docs/adr), and
 [milestone evidence](docs/evidence).
