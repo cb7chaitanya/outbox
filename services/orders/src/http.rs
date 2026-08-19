@@ -8,6 +8,10 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use contracts::Envelope;
+use contracts::inventory::{
+    INVENTORY_COMMANDS_TOPIC, RESERVE_INVENTORY_AGGREGATE_TYPE, RESERVE_INVENTORY_COMMAND_TYPE,
+    RESERVE_INVENTORY_SCHEMA_VERSION, ReserveInventoryItem, ReserveInventoryPayload,
+};
 use contracts::orders::{
     ORDER_AGGREGATE_TYPE, ORDER_CREATED_EVENT_TYPE, ORDER_CREATED_SCHEMA_VERSION,
     ORDER_CREATED_TOPIC, ORDERS_PRODUCER_NAME, OrderCreatedAmount, OrderCreatedItem,
@@ -242,11 +246,12 @@ async fn create_order(
     let correlation_id = extract_or_generate_correlation_id(&headers);
     let normalized = validate_and_normalize(body)?;
 
-    // Built once, up front, so the outbox row's event id stays stable even
+    // Built once, up front, so each outbox row's event id stays stable even
     // if a caller-level retry re-invokes this handler (spec section 13).
     // Only used when `delivery_mode == Outbox`; the closure checks that
     // itself so `create_order` doesn't need to know about delivery modes.
-    let event_id = Uuid::now_v7();
+    let order_created_event_id = Uuid::now_v7();
+    let reserve_inventory_event_id = Uuid::now_v7();
     let causation_id = Uuid::now_v7();
     let delivery_mode = state.delivery_mode;
     let event_items: Vec<OrderCreatedItem> = normalized
@@ -268,29 +273,68 @@ async fn create_order(
         Utc::now(),
         move |order_id, order_version| {
             if delivery_mode != DeliveryMode::Outbox {
-                return None;
+                return Vec::new();
             }
-            let envelope = build_order_created_envelope(
-                event_id,
+            let order_created_envelope = build_order_created_envelope(
+                order_created_event_id,
                 order_id,
                 order_version,
-                event_items,
+                event_items.clone(),
                 event_currency,
                 event_amount_minor,
                 correlation_id,
                 causation_id,
             );
-            let envelope_json =
-                serde_json::to_value(&envelope).expect("envelope serializes to json");
-            Some(NewOutboxEvent {
-                id: event_id,
-                aggregate_type: ORDER_AGGREGATE_TYPE.to_string(),
+            let order_created_json =
+                serde_json::to_value(&order_created_envelope).expect("envelope serializes to json");
+
+            let reserve_inventory_envelope = Envelope {
+                event_id: reserve_inventory_event_id,
+                event_type: RESERVE_INVENTORY_COMMAND_TYPE.to_string(),
+                schema_version: RESERVE_INVENTORY_SCHEMA_VERSION,
+                occurred_at: Utc::now(),
+                producer: ORDERS_PRODUCER_NAME.to_string(),
+                aggregate_type: RESERVE_INVENTORY_AGGREGATE_TYPE.to_string(),
                 aggregate_id: order_id,
                 aggregate_version: order_version,
-                topic: ORDER_CREATED_TOPIC.to_string(),
-                message_key: order_id.to_string(),
-                envelope: envelope_json,
-            })
+                correlation_id,
+                causation_id,
+                traceparent: None,
+                payload: ReserveInventoryPayload {
+                    order_id,
+                    items: event_items
+                        .into_iter()
+                        .map(|item| ReserveInventoryItem {
+                            sku: item.sku,
+                            quantity: item.quantity,
+                        })
+                        .collect(),
+                    expected_order_version: order_version,
+                },
+            };
+            let reserve_inventory_json = serde_json::to_value(&reserve_inventory_envelope)
+                .expect("envelope serializes to json");
+
+            vec![
+                NewOutboxEvent {
+                    id: order_created_event_id,
+                    aggregate_type: ORDER_AGGREGATE_TYPE.to_string(),
+                    aggregate_id: order_id,
+                    aggregate_version: order_version,
+                    topic: ORDER_CREATED_TOPIC.to_string(),
+                    message_key: order_id.to_string(),
+                    envelope: order_created_json,
+                },
+                NewOutboxEvent {
+                    id: reserve_inventory_event_id,
+                    aggregate_type: RESERVE_INVENTORY_AGGREGATE_TYPE.to_string(),
+                    aggregate_id: order_id,
+                    aggregate_version: order_version,
+                    topic: INVENTORY_COMMANDS_TOPIC.to_string(),
+                    message_key: order_id.to_string(),
+                    envelope: reserve_inventory_json,
+                },
+            ]
         },
     )
     .await?;

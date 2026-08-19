@@ -114,7 +114,7 @@ async fn transaction_rollback_produces_neither_order_nor_outbox_event(pool: PgPo
         &normalized,
         Uuid::now_v7(),
         Utc::now(),
-        |order_id, order_version| Some(new_outbox_event(order_id, order_version)),
+        |order_id, order_version| vec![new_outbox_event(order_id, order_version)],
     )
     .await;
 
@@ -152,7 +152,7 @@ async fn committed_order_has_exactly_one_outbox_row(pool: PgPool) {
         &normalized,
         Uuid::now_v7(),
         Utc::now(),
-        |order_id, order_version| Some(new_outbox_event(order_id, order_version)),
+        |order_id, order_version| vec![new_outbox_event(order_id, order_version)],
     )
     .await
     .unwrap();
@@ -177,7 +177,7 @@ async fn committed_order_has_exactly_one_outbox_row(pool: PgPool) {
         &normalized,
         Uuid::now_v7(),
         Utc::now(),
-        |order_id, order_version| Some(new_outbox_event(order_id, order_version)),
+        |order_id, order_version| vec![new_outbox_event(order_id, order_version)],
     )
     .await
     .unwrap();

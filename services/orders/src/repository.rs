@@ -106,11 +106,18 @@ fn fingerprint(normalized: &NormalizedOrder) -> String {
 /// Called only when a new order row is genuinely inserted by this call
 /// (never on an idempotent replay, per invariant I3 — a replay isn't a new
 /// business state change, so it gets no new outbox row), given the
-/// order's freshly generated id and version. Returning `None` means no
-/// event is required for this delivery mode (e.g. `DELIVERY_MODE=naive`,
-/// which still publishes directly, outside any transaction).
-pub trait OutboxEventBuilder: FnOnce(Uuid, i64) -> Option<NewOutboxEvent> {}
-impl<F: FnOnce(Uuid, i64) -> Option<NewOutboxEvent>> OutboxEventBuilder for F {}
+/// order's freshly generated id and version. Returns every outbox row
+/// this creation requires in this delivery mode — zero for
+/// `DELIVERY_MODE=naive` (which still publishes directly, outside any
+/// transaction), normally two under `outbox`: `orders.order_created` and
+/// the `inventory.reserve_inventory` command that kicks off M04's
+/// consumer (see `docs/adr/0007-orders-emits-reserve-inventory-command.md`).
+/// Multiple rows share one transaction, so either all of them exist or
+/// none do (invariant I3/I4) — the outbox table's uniqueness constraint is
+/// `(aggregate_type, aggregate_id, aggregate_version, topic)`, so rows for
+/// the same aggregate on different topics coexist without conflict.
+pub trait OutboxEventBuilder: FnOnce(Uuid, i64) -> Vec<NewOutboxEvent> {}
+impl<F: FnOnce(Uuid, i64) -> Vec<NewOutboxEvent>> OutboxEventBuilder for F {}
 
 pub async fn create_order(
     pool: &PgPool,
@@ -190,7 +197,7 @@ pub async fn create_order(
     .execute(&mut *tx)
     .await?;
 
-    if let Some(event) = build_outbox_event(order.id, order.version) {
+    for event in build_outbox_event(order.id, order.version) {
         persistence::outbox::insert(&mut tx, now, &event).await?;
     }
 

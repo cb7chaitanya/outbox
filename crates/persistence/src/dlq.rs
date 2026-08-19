@@ -63,6 +63,9 @@ mod tests {
 
     #[test]
     fn dlq_topic_appends_suffix() {
-        assert_eq!(dlq_topic("inventory.commands.v1"), "inventory.commands.v1.dlq");
+        assert_eq!(
+            dlq_topic("inventory.commands.v1"),
+            "inventory.commands.v1.dlq"
+        );
     }
 }

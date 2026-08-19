@@ -133,14 +133,16 @@ mod live_tests {
             .expect("connect consumer");
 
         let topic = "orders.events.v1";
-        let before = consumer
-            .fetch(topic, 0, 100)
-            .await
-            .expect("initial fetch");
+        let before = consumer.fetch(topic, 0, 100).await.expect("initial fetch");
         let start_offset = before.last().map(|r| r.offset + 1).unwrap_or(0);
 
         producer
-            .publish(topic, "consumer-smoke-key", b"hello-consumer".to_vec(), vec![])
+            .publish(
+                topic,
+                "consumer-smoke-key",
+                b"hello-consumer".to_vec(),
+                vec![],
+            )
             .await
             .expect("publish");
 
@@ -149,6 +151,9 @@ mod live_tests {
             .await
             .expect("fetch after publish");
         assert!(!after.is_empty(), "expected at least one new record");
-        assert_eq!(after[0].value.as_deref(), Some(b"hello-consumer".as_slice()));
+        assert_eq!(
+            after[0].value.as_deref(),
+            Some(b"hello-consumer".as_slice())
+        );
     }
 }
