@@ -32,6 +32,11 @@ pub struct OrderRow {
     pub version: i64,
     pub cancellation_reason: Option<String>,
     pub correlation_id: Uuid,
+    /// The inventory reservation backing this order, once
+    /// `reservation_succeeded` has been processed (spec section 12
+    /// compensation matrix: needed to build `release_inventory` on a later
+    /// payment failure, without a cross-service join).
+    pub reservation_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -56,7 +61,8 @@ pub struct TransitionRow {
 }
 
 const ORDER_COLUMNS: &str = "id, idempotency_key, idempotency_request_hash, status, \
-     currency, amount_minor, version, cancellation_reason, correlation_id, created_at, updated_at";
+     currency, amount_minor, version, cancellation_reason, correlation_id, reservation_id, \
+     created_at, updated_at";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
@@ -391,12 +397,14 @@ pub async fn transition_order(
 /// separate transaction from this one would let a crash between the two
 /// silently strand the order (the redelivered event would then see an
 /// already-processed inbox row and skip reacting entirely).
+#[allow(clippy::too_many_arguments)]
 pub async fn transition_order_with_outbox(
     conn: &mut sqlx::PgConnection,
     order_id: Uuid,
     to: OrderStatus,
     reason: Option<&str>,
     triggering_event_id: Option<Uuid>,
+    reservation_id: Option<Uuid>,
     now: DateTime<Utc>,
     build_outbox_event: impl OutboxEventBuilder,
 ) -> Result<OrderRow, TransitionError> {
@@ -417,8 +425,12 @@ pub async fn transition_order_with_outbox(
         });
     }
 
+    // `coalesce($5, reservation_id)` leaves the column untouched when the
+    // caller passes `None` (every transition except the one that first
+    // learns the reservation id, on `reservation_succeeded`).
     let update_sql = format!(
-        "update orders set status = $1, version = version + 1, updated_at = $2 \
+        "update orders set status = $1, version = version + 1, updated_at = $2, \
+         reservation_id = coalesce($5, reservation_id) \
          where id = $3 and version = $4 \
          returning {ORDER_COLUMNS}"
     );
@@ -427,6 +439,7 @@ pub async fn transition_order_with_outbox(
         .bind(now)
         .bind(order_id)
         .bind(current.version)
+        .bind(reservation_id)
         .fetch_optional(&mut *conn)
         .await?;
     let Some(updated) = updated else {
