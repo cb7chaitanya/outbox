@@ -8,7 +8,7 @@ optional saga orchestrator — until the same failures are handled
 correctly. See `PROJECT_2_SPEC.md` for the full contract this repository
 implements, milestone by milestone.
 
-## What's built so far (M00-M05)
+## What's built so far (M00-M06)
 
 Workspace scaffolding (M00), the orders service's local-consistency core
 (M01: idempotent order creation, versioned state machine, transition
@@ -31,23 +31,36 @@ through its own outbox, and dead-letter anything it can't process
 (malformed envelope, unsupported schema, out-of-order gap) without
 blocking the rest of the partition.
 
-M05 adds the `payments` service and closes the loop on the happy path:
-`orders` now also consumes `reservation_succeeded`/`reservation_failed`
-from `inventory.events.v1`, transitions the order to
-`INVENTORY_RESERVED`, and emits `payments.authorize_payment` — all in one
-transaction (see `docs/adr/0010-orders-consumes-reservation-outcomes.md`;
-the `reservation_failed` reaction is deliberately deferred to M06's
-compensation matrix). `payments` authorizes against an in-process fake
-provider that honors its own idempotency keys independently of this
-service's inbox/outbox layers, applies spec section 15's error
-classification and full-jitter-backoff retry budget around it, and emits
-`payment_authorized`/`payment_failed`/`payment_refunded`. A real
-`POST /v1/orders` now reaches an `AUTHORIZED` payment in well under a
-second with no manual steps — see `docs/evidence/m05.md` for a live,
-end-to-end transcript. The naive publish path from M02 stays runnable
-behind `DELIVERY_MODE=naive` so its failure lab remains reproducible;
-`DELIVERY_MODE=outbox` is the default. Fulfilment remains a
-health-endpoint skeleton (M07). Track progress in
+M05 adds the `payments` service: `orders` consumes
+`reservation_succeeded`/`reservation_failed` from `inventory.events.v1`
+and, on success, emits `payments.authorize_payment` — all in one
+transaction (see `docs/adr/0010-orders-consumes-reservation-outcomes.md`).
+`payments` authorizes against an in-process fake provider that honors its
+own idempotency keys independently of this service's inbox/outbox layers,
+applies spec section 15's error classification and full-jitter-backoff
+retry budget around it, and emits
+`payment_authorized`/`payment_failed`/`payment_refunded`.
+
+M06 completes the choreography-first happy path through
+`PAYMENT_AUTHORIZED` and the first two rows of the compensation matrix
+(spec section 12): orders' outcome consumer now also reacts to
+`payments.events.v1`, and every outbound command (`reserve_inventory`,
+`authorize_payment`, `release_inventory`) is versioned by a real per-
+`(order, downstream target)` counter rather than a placeholder constant
+(see `docs/adr/0011-per-target-command-version-counter.md`). A rejected
+reservation now cancels the order directly — nothing to compensate, no
+payment ever attempted. A payment decline drives inventory to release the
+reservation via a new `inventory.release_inventory`/`inventory_released`
+round trip, and the order only reaches `CANCELLED` once that release is
+confirmed, not before. A real `POST /v1/orders` now reaches
+`PAYMENT_AUTHORIZED` in well under two seconds with no manual steps — see
+`docs/evidence/m06.md` for a live, end-to-end transcript (including a real
+poison-isolation bug this exact run caught and fixed). The naive publish
+path from M02 stays runnable behind `DELIVERY_MODE=naive` so its failure
+lab remains reproducible; `DELIVERY_MODE=outbox` is the default.
+Fulfilment remains a health-endpoint skeleton, and compensation matrix
+rows 3-4 (fulfilment failure, retry exhaustion → `MANUAL_REVIEW`) are not
+yet implemented — both are M07's job. Track progress in
 [`docs/progress.md`](docs/progress.md).
 
 ## Architecture
@@ -257,8 +270,31 @@ automated demonstrations of all five M05 acceptance gates (timeout-then-
 success, lost-response-then-retry, decline, poison-DLQ, idempotent
 refund): `services/payments/tests/consumer_tests.rs`.
 
-This section grows as later milestones (fulfilment, choreography
-compensation, M06+) land; see `docs/progress.md` for current status.
+**Choreographed workflow and compensation (M06):** `orders`' outcome
+consumer now dispatches across both `inventory.events.v1` and
+`payments.events.v1` by `event_type` (one module, one consumer name, two
+background poll loops). `payment_authorized` drives
+`INVENTORY_RESERVED`→`PAYMENT_AUTHORIZED` (M06 stops there; readiness for
+fulfilment is M07's job). `reservation_failed` now drives real
+compensation — `PENDING`→`CANCELLING`→`CANCELLED` directly, since nothing
+was ever reserved or paid, so nothing needs releasing. `payment_failed`
+emits `inventory.release_inventory` (a new consumer path on `inventory`,
+idempotent the same way `reserve`/authorize already are — releasing an
+already-released reservation is a no-op) and moves the order to
+`CANCELLING`; only `inventory_released`, inventory's confirmation event,
+moves it the rest of the way to `CANCELLED`. Every outbound command's
+`aggregate_version` now comes from a real per-`(order, target)` counter
+(`outbound_command_sequences`) instead of a hardcoded value — see
+`docs/adr/0011-per-target-command-version-counter.md` for why that
+mattered the moment a second command (`release_inventory`) joined
+`reserve_inventory` on the same orders→inventory relationship. Deterministic,
+automated demonstrations of all five M06 acceptance gates plus a
+poison-isolation regression test:
+`services/orders/tests/choreography_tests.rs`.
+
+This section grows as later milestones (fulfilment, the rest of the
+compensation matrix, M07+) land; see `docs/progress.md` for current
+status.
 
 ## Delivery semantics
 
@@ -320,22 +356,23 @@ When enabled, `orders` mounts `PUT /_test/faults/{name}` and
 
 ## Known limitations
 
-- M00-M04 only: `orders` and `inventory` are wired end-to-end (order
-  creation → `reserve_inventory` command → reservation →
-  `reservation_succeeded`/`reservation_failed`), but nothing yet reacts to
-  inventory's outcome events — orders does not update its own status from
-  them until M06's choreography lands (spec section 12's transition graph
-  is encoded but only `PENDING` is reachable end-to-end so far). Payments
-  and fulfilment remain health-endpoint skeletons with no persistence
-  wiring, so their `/health/ready` doesn't check a dependency yet.
-- An out-of-order aggregate version at the inventory consumer goes
-  straight to DLQ (`EXPECTED_VERSION_GAP`) rather than through the bounded
-  retry/buffer window spec section 14 describes — that window is M08's
-  deliverable by name; see `docs/adr/0008-m04-gap-policy-scope-boundary.md`.
-- The inventory consumer is not yet safe to run as multiple concurrent
-  replicas against the same topic/partition (no consumer-group-style
-  partition assignment) — see `docs/adr/0006-inbox-consumer-offset-ledger.md`'s
-  consequences section.
+- M00-M06: `orders`, `inventory`, and `payments` are wired end-to-end
+  through `PAYMENT_AUTHORIZED` (order creation → reservation → payment
+  authorization), and the first two compensation-matrix rows (inventory
+  rejected; payment failed after reservation) are implemented. Rows 3-4
+  (fulfilment failure → refund + release; compensation retry exhaustion →
+  `MANUAL_REVIEW`) are not — both need the fulfilment service, which
+  remains a health-endpoint skeleton with no persistence wiring, so its
+  `/health/ready` doesn't check a dependency yet. `READY_FOR_FULFILMENT`
+  and `COMPLETED` are therefore unreachable until M07.
+- An out-of-order aggregate version at any consumer goes straight to DLQ
+  (`EXPECTED_VERSION_GAP`) rather than through the bounded retry/buffer
+  window spec section 14 describes — that window is M08's deliverable by
+  name; see `docs/adr/0008-m04-gap-policy-scope-boundary.md`.
+- No consumer (inventory, payments, or orders' outcome consumer) is yet
+  safe to run as multiple concurrent replicas against the same
+  topic/partition (no consumer-group-style partition assignment) — see
+  `docs/adr/0006-inbox-consumer-offset-ledger.md`'s consequences section.
 - The naive publish path (still runnable behind `DELIVERY_MODE=naive`)
   republishes on every accepted create call, including idempotent
   replays — a deliberate, documented anti-pattern
@@ -344,10 +381,11 @@ When enabled, `orders` mounts `PUT /_test/faults/{name}` and
   order is genuinely created.
 - The outbox publisher's retry backoff uses an unseeded RNG for M03
   (full-jitter per spec section 15); deterministic/seeded retry timing
-  for tests is deferred to M05's full retry-taxonomy milestone.
+  for tests is deferred to M08's invariant-harness milestone.
 - `POST /v1/orders/{id}/cancel` does not exist yet — it is optional per
-  spec section 10 and deferred until the choreographed workflow (M06+)
-  gives it something meaningful to cancel.
+  spec section 10 and deferred until the compensation matrix is complete
+  (M07) gives it something meaningful to cancel from every reachable
+  state.
 - No orchestrator exists; it is optional and only added after M10
   (core milestones) are complete, per spec section 24.
 
