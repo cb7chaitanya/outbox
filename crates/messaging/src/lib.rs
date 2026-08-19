@@ -16,7 +16,10 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 pub mod consumer;
-pub use consumer::{ConsumedRecord, Consumer, NoopConsumer, RskafkaConsumer};
+pub use consumer::{
+    ConsumedRecord, Consumer, ContiguousOffsetTracker, NoopConsumer, RskafkaConsumer,
+    order_by_aggregate_version,
+};
 
 #[derive(Debug, Error)]
 pub enum MessagingError {

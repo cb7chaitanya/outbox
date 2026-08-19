@@ -1150,7 +1150,9 @@ pub async fn process_available(
         ..Default::default()
     };
 
-    for record in &records {
+    let ordered_records = messaging::order_by_aggregate_version(&records);
+    let mut offset_tracker = messaging::ContiguousOffsetTracker::new(start_offset);
+    for record in &ordered_records {
         let outcome = handle_one(pool, producer, source_topic, record).await?;
         match outcome {
             HandleOutcome::Applied => summary.applied += 1,
@@ -1171,15 +1173,17 @@ pub async fn process_available(
             return Ok(summary);
         }
 
-        persistence::inbox::commit_offset(
-            pool,
-            CONSUMER_NAME,
-            source_topic,
-            SOURCE_PARTITION,
-            record.offset + 1,
-            Utc::now(),
-        )
-        .await?;
+        if let Some(next_offset) = offset_tracker.complete(record.offset) {
+            persistence::inbox::commit_offset(
+                pool,
+                CONSUMER_NAME,
+                source_topic,
+                SOURCE_PARTITION,
+                next_offset,
+                Utc::now(),
+            )
+            .await?;
+        }
     }
 
     Ok(summary)

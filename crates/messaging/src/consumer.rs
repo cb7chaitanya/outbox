@@ -8,6 +8,7 @@
 //! processed" themselves — see `persistence::inbox::fetch_offset` /
 //! `commit_offset` and `docs/adr/0006-inbox-consumer-offset-ledger.md`.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -24,6 +25,56 @@ pub struct ConsumedRecord {
     pub key: Option<Vec<u8>>,
     pub value: Option<Vec<u8>>,
     pub headers: HashMap<String, Vec<u8>>,
+}
+
+#[derive(serde::Deserialize)]
+struct OrderingEnvelope {
+    aggregate_id: String,
+    aggregate_version: i64,
+}
+
+/// Reorders a fetched window so versions for the same aggregate are handled
+/// oldest-first. Malformed records retain broker order and are still handled
+/// by the normal poison path. Offset acknowledgement remains safe through
+/// [`ContiguousOffsetTracker`].
+pub fn order_by_aggregate_version(records: &[ConsumedRecord]) -> Vec<ConsumedRecord> {
+    let mut ordered = records.to_vec();
+    ordered.sort_by_cached_key(|record| {
+        record
+            .value
+            .as_deref()
+            .and_then(|value| serde_json::from_slice::<OrderingEnvelope>(value).ok())
+            .map(|env| (0_u8, env.aggregate_id, env.aggregate_version, record.offset))
+            .unwrap_or_else(|| (1, String::new(), 0, record.offset))
+    });
+    ordered
+}
+
+/// Tracks completed records processed out of broker order and exposes only
+/// the highest contiguous next offset. A crash can therefore replay work but
+/// can never skip an unprocessed lower offset.
+#[derive(Debug)]
+pub struct ContiguousOffsetTracker {
+    next: i64,
+    completed: BTreeSet<i64>,
+}
+
+impl ContiguousOffsetTracker {
+    pub fn new(start: i64) -> Self {
+        Self {
+            next: start,
+            completed: BTreeSet::new(),
+        }
+    }
+
+    pub fn complete(&mut self, offset: i64) -> Option<i64> {
+        self.completed.insert(offset);
+        let before = self.next;
+        while self.completed.remove(&self.next) {
+            self.next += 1;
+        }
+        (self.next > before).then_some(self.next)
+    }
 }
 
 /// Every topic this project uses has a single partition (spec section 8),
@@ -104,6 +155,58 @@ impl Consumer for RskafkaConsumer {
     async fn latest_offset(&self, topic: &str) -> Result<i64, MessagingError> {
         let partition_client = self.partition_client(topic).await?;
         Ok(partition_client.get_offset(OffsetAt::Latest).await?)
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn record(offset: i64, aggregate: &str, version: i64) -> ConsumedRecord {
+        ConsumedRecord {
+            offset,
+            key: None,
+            headers: HashMap::new(),
+            value: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "aggregate_id": aggregate, "aggregate_version": version
+                }))
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn fetched_gap_is_reordered_without_losing_broker_offsets() {
+        let records = vec![record(10, "a", 2), record(11, "b", 1), record(12, "a", 1)];
+        let ordered = order_by_aggregate_version(&records);
+        assert_eq!(
+            ordered.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![12, 10, 11]
+        );
+        let mut tracker = ContiguousOffsetTracker::new(10);
+        assert_eq!(tracker.complete(12), None);
+        assert_eq!(tracker.complete(10), Some(11));
+        assert_eq!(tracker.complete(11), Some(13));
+    }
+
+    proptest! {
+        #[test]
+        fn contiguous_tracker_never_skips_a_hole(mut offsets in proptest::collection::vec(0_i64..40, 1..100)) {
+            offsets.sort_unstable();
+            offsets.dedup();
+            let mut shuffled = offsets.clone();
+            shuffled.reverse();
+            let mut tracker = ContiguousOffsetTracker::new(0);
+            let mut committed = 0;
+            for offset in shuffled {
+                if let Some(next) = tracker.complete(offset) {
+                    committed = next;
+                }
+                prop_assert!((0..committed).all(|n| offsets.contains(&n)));
+            }
+        }
     }
 }
 
