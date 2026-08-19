@@ -337,3 +337,84 @@ pub async fn transition_order(
     tx.commit().await?;
     Ok(updated)
 }
+
+/// Like [`transition_order`], but locks the current row instead of taking
+/// a caller-supplied `expected_version` (the reservation-outcome consumer
+/// doesn't have that to hand), records `triggering_event_id`, and inserts
+/// any outbox events the transition itself requires.
+///
+/// Takes an already-open transaction connection rather than a pool, for
+/// the same reason `inventory::repository::reserve` does: the caller (the
+/// reservation-outcome consumer) must apply this mutation and its inbox
+/// claim/mark in one transaction (spec section 14 steps 4-6) — invariant
+/// I3 makes "reacted to the outcome" and "emitted `authorize_payment`" one
+/// atomic business change, not two, and committing the inbox mark in a
+/// separate transaction from this one would let a crash between the two
+/// silently strand the order (the redelivered event would then see an
+/// already-processed inbox row and skip reacting entirely).
+pub async fn transition_order_with_outbox(
+    conn: &mut sqlx::PgConnection,
+    order_id: Uuid,
+    to: OrderStatus,
+    reason: Option<&str>,
+    triggering_event_id: Option<Uuid>,
+    now: DateTime<Utc>,
+    build_outbox_event: impl OutboxEventBuilder,
+) -> Result<OrderRow, TransitionError> {
+    let current = sqlx::query_as::<_, OrderRow>(&format!(
+        "select {ORDER_COLUMNS} from orders where id = $1 for update"
+    ))
+    .bind(order_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(current) = current else {
+        return Err(TransitionError::NotFound);
+    };
+
+    if !is_legal_transition(current.status, to) {
+        return Err(TransitionError::IllegalTransition {
+            from: current.status,
+            to,
+        });
+    }
+
+    let update_sql = format!(
+        "update orders set status = $1, version = version + 1, updated_at = $2 \
+         where id = $3 and version = $4 \
+         returning {ORDER_COLUMNS}"
+    );
+    let updated = sqlx::query_as::<_, OrderRow>(&update_sql)
+        .bind(to)
+        .bind(now)
+        .bind(order_id)
+        .bind(current.version)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(updated) = updated else {
+        return Err(TransitionError::VersionConflict {
+            expected: current.version,
+        });
+    };
+
+    sqlx::query(
+        "insert into order_transitions \
+         (id, order_id, from_status, to_status, reason, triggering_event_id, order_version, created_at) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(order_id)
+    .bind(current.status)
+    .bind(to)
+    .bind(reason)
+    .bind(triggering_event_id)
+    .bind(updated.version)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+
+    for event in build_outbox_event(order_id, updated.version) {
+        persistence::outbox::insert(conn, now, &event).await?;
+    }
+
+    Ok(updated)
+}
