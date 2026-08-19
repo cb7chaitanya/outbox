@@ -18,11 +18,26 @@ pub const RESERVATION_SUCCEEDED_SCHEMA_VERSION: u32 = 1;
 pub const RESERVATION_FAILED_EVENT_TYPE: &str = "inventory.reservation_failed";
 pub const RESERVATION_FAILED_SCHEMA_VERSION: u32 = 1;
 
+pub const RELEASE_INVENTORY_COMMAND_TYPE: &str = "inventory.release_inventory";
+pub const RELEASE_INVENTORY_SCHEMA_VERSION: u32 = 1;
+
+pub const INVENTORY_RELEASED_EVENT_TYPE: &str = "inventory.inventory_released";
+pub const INVENTORY_RELEASED_SCHEMA_VERSION: u32 = 1;
+
 /// The `reserve_inventory` command's aggregate type is `order`, matching
 /// the aggregate that owns the version it carries (`expected_order_version`
 /// — the order aggregate's version at the moment orders emitted this
 /// command, spec section 8's payload table).
 pub const RESERVE_INVENTORY_AGGREGATE_TYPE: &str = "order";
+
+/// `release_inventory` shares `reserve_inventory`'s aggregate type and
+/// envelope-version space: both are commands orders sends to inventory on
+/// `inventory.commands.v1`, ordered against the same per-`(order_id,
+/// "inventory")` counter (spec section 14; see
+/// `docs/adr/0011-per-target-command-version-counter.md`), so a released
+/// order's compensation command is never mistaken for a stale or gapped
+/// reservation command by inventory's inbox.
+pub const RELEASE_INVENTORY_AGGREGATE_TYPE: &str = RESERVE_INVENTORY_AGGREGATE_TYPE;
 
 /// `reservation_succeeded`/`reservation_failed` are inventory's own facts
 /// about a reservation, keyed by the reservation aggregate itself.
@@ -53,6 +68,19 @@ pub struct ReservationFailedPayload {
     pub order_id: Uuid,
     pub reason_code: String,
     pub items: Vec<ReserveInventoryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseInventoryPayload {
+    pub order_id: Uuid,
+    pub reservation_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InventoryReleasedPayload {
+    pub order_id: Uuid,
+    pub reservation_id: Uuid,
 }
 
 #[cfg(test)]
