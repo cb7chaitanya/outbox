@@ -82,6 +82,40 @@ pub enum DomainError {
     InvalidCurrency(String),
 }
 
+/// Centralized error classification (spec section 15): every consumer or
+/// downstream-call failure this project produces maps to exactly one of
+/// these, and the class alone decides the handling — retry, DLQ, or a
+/// domain failure event. Not a replacement for a service's own error type;
+/// service errors implement a small "what class am I" mapping onto this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Timeout, connection reset, broker/provider unavailable, SQL
+    /// serialization/deadlock: retry with backoff.
+    Transient,
+    /// Optimistic version conflict that may resolve on a short retry/re-read.
+    Contention,
+    /// Provider `429`/overload: honor retry-after, then retry.
+    RateLimited,
+    /// Invalid payload, unsupported schema, impossible transition,
+    /// insufficient stock, declined payment: a business failure event or
+    /// DLQ, never a blind retry.
+    Permanent,
+    /// Same event id redelivered with a different payload, corrupt JSON:
+    /// immediate DLQ plus alert, invariant I11's integrity case.
+    Poison,
+}
+
+impl ErrorClass {
+    /// Section 15: only `Transient`, `Contention`, and `RateLimited` are
+    /// ever retried; `Permanent` and `Poison` never are.
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            ErrorClass::Transient | ErrorClass::Contention | ErrorClass::RateLimited
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
