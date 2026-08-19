@@ -11,6 +11,7 @@ members = [
   "services/inventory",
   "services/payments",
   "services/fulfilment",
+  "tools/replay-dlq",
 ]
 
 [workspace.package]
