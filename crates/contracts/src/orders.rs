@@ -11,6 +11,12 @@ pub const ORDER_CREATED_TOPIC: &str = "orders.events.v1";
 pub const ORDERS_PRODUCER_NAME: &str = "orders";
 pub const ORDER_AGGREGATE_TYPE: &str = "order";
 
+pub const ORDER_COMPLETED_EVENT_TYPE: &str = "orders.order_completed";
+pub const ORDER_COMPLETED_SCHEMA_VERSION: u32 = 1;
+
+pub const ORDER_CANCELLED_EVENT_TYPE: &str = "orders.order_cancelled";
+pub const ORDER_CANCELLED_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderCreatedItem {
     pub sku: String,
@@ -28,6 +34,18 @@ pub struct OrderCreatedPayload {
     pub order_id: Uuid,
     pub items: Vec<OrderCreatedItem>,
     pub amount: OrderCreatedAmount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderCompletedPayload {
+    pub order_id: Uuid,
+    pub fulfilment_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderCancelledPayload {
+    pub order_id: Uuid,
+    pub reason_code: String,
 }
 
 #[cfg(test)]

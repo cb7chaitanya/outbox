@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod fulfilment;
 pub mod inventory;
 pub mod orders;
 pub mod payments;

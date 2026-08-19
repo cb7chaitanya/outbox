@@ -24,6 +24,14 @@ pub const RELEASE_INVENTORY_SCHEMA_VERSION: u32 = 1;
 pub const INVENTORY_RELEASED_EVENT_TYPE: &str = "inventory.inventory_released";
 pub const INVENTORY_RELEASED_SCHEMA_VERSION: u32 = 1;
 
+/// Not in spec section 8's original catalog — added in M07 so orders can
+/// learn a release permanently failed (compensation matrix row 4: retry
+/// budget exhausted -> `MANUAL_REVIEW`) and react, since orders never
+/// consumes DLQ topics directly. See
+/// `docs/adr/0012-compensation-retry-exhaustion-signaling.md`.
+pub const RELEASE_FAILED_EVENT_TYPE: &str = "inventory.release_failed";
+pub const RELEASE_FAILED_SCHEMA_VERSION: u32 = 1;
+
 /// The `reserve_inventory` command's aggregate type is `order`, matching
 /// the aggregate that owns the version it carries (`expected_order_version`
 /// — the order aggregate's version at the moment orders emitted this
@@ -81,6 +89,13 @@ pub struct ReleaseInventoryPayload {
 pub struct InventoryReleasedPayload {
     pub order_id: Uuid,
     pub reservation_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseFailedPayload {
+    pub order_id: Uuid,
+    pub reservation_id: Uuid,
+    pub reason_code: String,
 }
 
 #[cfg(test)]

@@ -26,6 +26,12 @@ pub const REFUND_PAYMENT_SCHEMA_VERSION: u32 = 1;
 pub const PAYMENT_REFUNDED_EVENT_TYPE: &str = "payments.payment_refunded";
 pub const PAYMENT_REFUNDED_SCHEMA_VERSION: u32 = 1;
 
+/// Not in spec section 8's original catalog — added in M07, symmetric with
+/// `inventory.release_failed`. See
+/// `docs/adr/0012-compensation-retry-exhaustion-signaling.md`.
+pub const REFUND_FAILED_EVENT_TYPE: &str = "payments.refund_failed";
+pub const REFUND_FAILED_SCHEMA_VERSION: u32 = 1;
+
 /// Both commands carry `order_id` as their envelope `aggregate_id`,
 /// matching `inventory.reserve_inventory`'s convention (spec section 8):
 /// the order aggregate owns the version these commands are ordered against.
@@ -73,6 +79,13 @@ pub struct RefundPaymentPayload {
 pub struct PaymentRefundedPayload {
     pub order_id: Uuid,
     pub payment_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundFailedPayload {
+    pub order_id: Uuid,
+    pub payment_id: Uuid,
+    pub reason_code: String,
 }
 
 #[cfg(test)]
