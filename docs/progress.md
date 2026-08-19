@@ -5,7 +5,7 @@
 - [x] M00 — Repository contract and skeleton
 - [x] M01 — Orders API and local consistency
 - [x] M02 — Naive dual write and failure lab
-- [ ] M03 — Transactional outbox
+- [x] M03 — Transactional outbox
 - [ ] M04 — Inventory consumer and idempotent inbox
 - [ ] M05 — Payments with retry taxonomy
 - [ ] M06 — Choreographed workflow and compensation
@@ -17,7 +17,7 @@
 
 ## Current milestone
 
-M02 complete. Next action: M03 — transactional outbox.
+M03 complete. Next action: M04 — inventory consumer and idempotent inbox.
 
 ## Decisions
 
@@ -69,6 +69,30 @@ M02 complete. Next action: M03 — transactional outbox.
   `naive` (M02) — `outbox` parses but has no implementation until M03,
   per spec section 11's "defaulting to outbox" instruction, which only
   applies "after outbox introduction."
+- M03 flips `DELIVERY_MODE`'s default back to `outbox`, now with a real
+  implementation, per spec section 11's closing paragraph. `naive` stays
+  fully runnable and its M02 tests/demo script are untouched.
+- The outbox event builder is passed into `repository::create_order` as
+  an `impl FnOnce(Uuid, i64) -> Option<NewOutboxEvent>` closure, invoked
+  with the order's id/version only when a row is genuinely created (never
+  on a replay). This keeps `persistence` and `orders::repository` free of
+  any dependency on concrete event payload types from `contracts`. See
+  `docs/adr/0005-outbox-claim-lease-and-backoff-design.md`.
+- `claim_batch`'s query returns `was_previously_claimed` computed inside
+  the same atomic `UPDATE ... RETURNING`, so the "lease recovery" metric
+  (spec section 16) is exact, not inferred after the fact.
+- M03's publisher implements the exact full-jitter backoff formula from
+  spec section 15 but not that section's full error-classification/retry-
+  budget taxonomy — deferred to M05, which owns that taxonomy for every
+  service. Documented as an explicit scope boundary in ADR 0005.
+- The broker-outage acceptance test uses a `FlakyProducer` test double
+  (an `AtomicBool` toggle) rather than stopping the real Redpanda
+  container, for test speed and determinism; `docker compose stop
+  redpanda` remains available for slower end-to-end chaos checks in M09.
+- Outbox publisher runs unconditionally from `main.rs` regardless of
+  `delivery_mode` (a no-op poll loop when the table is empty in naive
+  mode), so toggling `DELIVERY_MODE` back to `outbox` never needs a
+  restart-time wiring change.
 
 ## Commands run and results (M00)
 
@@ -128,13 +152,39 @@ transcript excerpts, including both dual-write gate reproductions, are in
 Total orders-service tests: 26 passed, 0 failed (24 from M01 unchanged +
 2 new dual-write demonstrations).
 
+## Commands run and results (M03)
+
+All commands below were actually run in this repository state on
+2026-08-19, against the M00-M02 infrastructure (still running). Full
+transcript excerpts, including all six M03 acceptance-gate proofs and a
+live end-to-end `/metrics` check, are in `docs/evidence/m03.md`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 warnings |
+| `make test` (fmt + lint + unit + integration) | all green |
+| `cargo test -p orders --test outbox_tests` | 6/6, all six M03 acceptance gates |
+| same, repeated 5x with `--test-threads=4` | 6/6 every run, no flakes |
+| `make demo-naive-failure` | exit 0; M02 lab still reproduces both gaps unchanged |
+| `cargo run -p orders` + curl create + `/metrics` | live order published end-to-end via the background publisher; `outbox_unpublished_count 0`, `outbox_publish_success_total 1` |
+
+Total orders-service tests: 34 passed, 0 failed (26 from M01+M02
+unchanged + 6 new outbox acceptance demonstrations, plus 3 new
+`full_jitter_backoff` unit tests in `persistence`).
+
 ## Next action
 
-Start M03: transactional outbox. Add `outbox_events` table/migration
-(spec section 9), rewrite `create_order` to insert the business row and
-the outbox envelope in the same transaction, build the claim-lease
-publisher worker (`FOR UPDATE SKIP LOCKED`, spec section 13), and wire
-`DELIVERY_MODE=outbox` as a second real code path alongside `naive`
-(which must keep working — the M02 failure lab stays runnable per spec
-section 11's closing paragraph). Do not remove or weaken
-`dual_write_tests.rs`.
+Start M04: inventory consumer and idempotent inbox. Add the
+`inbox_events`/`consumer_aggregate_versions` tables and claim/dedupe
+primitives to `persistence` (spec section 9, section 14), build the
+inventory service's stock/reservation schema and multi-SKU
+sorted-lock-order reservation transaction (spec section 9 "Inventory"),
+consume `orders.order_created` from `orders.events.v1` with the
+inbox-transaction discipline (validate → insert inbox row with `ON
+CONFLICT DO NOTHING` → check hash on duplicate → apply mutation →
+insert outbox events → mark processed → commit DB → commit Kafka offset
+only after), and reuse this milestone's outbox publisher/backoff code
+for inventory's own outbox rather than duplicating it. Do not disable
+Kafka auto-commit assumptions loosely — offset commit must happen only
+after the local transaction commits.
