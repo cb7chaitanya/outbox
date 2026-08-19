@@ -80,7 +80,7 @@ demo-naive-failure:
 	./scripts/demo-dual-write-failure.sh
 
 chaos-smoke:
-	@echo "chaos-smoke: not yet implemented (lands with M09 observability and chaos)"
+	./scripts/chaos-smoke.sh
 
 ## Tail logs for a specific order across services. Usage: make logs ORDER_ID=<uuid>
 logs:
