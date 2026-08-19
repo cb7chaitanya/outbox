@@ -12,6 +12,11 @@ mod common;
 
 use chrono::Utc;
 use contracts::Envelope;
+use contracts::fulfilment::{
+    FULFILMENT_AGGREGATE_TYPE, FULFILMENT_CREATED_EVENT_TYPE, FULFILMENT_CREATED_SCHEMA_VERSION,
+    FULFILMENT_EVENTS_TOPIC, FULFILMENT_FAILED_EVENT_TYPE, FULFILMENT_FAILED_SCHEMA_VERSION,
+    FulfilmentCreatedPayload, FulfilmentFailedPayload,
+};
 use contracts::inventory::ReleaseInventoryPayload;
 use contracts::inventory::{
     INVENTORY_COMMANDS_TOPIC, INVENTORY_EVENTS_TOPIC, INVENTORY_RELEASED_EVENT_TYPE,
@@ -25,6 +30,11 @@ use contracts::payments::{
     PAYMENT_AUTHORIZED_SCHEMA_VERSION, PAYMENT_FAILED_EVENT_TYPE, PAYMENT_FAILED_SCHEMA_VERSION,
     PAYMENTS_COMMANDS_TOPIC, PAYMENTS_EVENTS_TOPIC, PaymentAuthorizedPayload, PaymentFailedPayload,
 };
+use contracts::payments::{
+    PAYMENT_REFUNDED_EVENT_TYPE, PAYMENT_REFUNDED_SCHEMA_VERSION, PaymentRefundedPayload,
+    REFUND_FAILED_EVENT_TYPE, REFUND_FAILED_SCHEMA_VERSION, RefundFailedPayload,
+};
+use messaging::Consumer;
 use orders::config::DeliveryMode;
 use orders::domain::OrderStatus;
 use serde_json::{Value, json};
@@ -120,13 +130,238 @@ async fn order_status(pool: &PgPool, order_id: Uuid) -> OrderStatus {
         .expect("order exists")
 }
 
+async fn insert_ready_order(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+    let order_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+    let reservation_id = Uuid::now_v7();
+    let payment_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into orders (id, idempotency_key, idempotency_request_hash, status, currency, \
+        amount_minor, version, correlation_id, reservation_id, payment_id, created_at, updated_at) \
+        values ($1, $2, 'test', 'READY_FOR_FULFILMENT', 'USD', 2500, 4, $3, $4, $5, now(), now())",
+    )
+    .bind(order_id)
+    .bind(format!("m07-{order_id}"))
+    .bind(correlation_id)
+    .bind(reservation_id)
+    .bind(payment_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    (order_id, correlation_id, reservation_id, payment_id)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn fulfilment_success_completes_exactly_once(pool: PgPool) {
+    let _guard = common::topic_lock().await;
+    let producer = common::connect_producer().await;
+    let consumer = common::connect_consumer().await;
+    let faults = FaultInjector::new();
+    common::seed_outcome_offset_to_latest(&pool, &consumer, FULFILMENT_EVENTS_TOPIC).await;
+    let (order_id, correlation_id, _, _) = insert_ready_order(&pool).await;
+    let fulfilment_id = Uuid::now_v7();
+    let (_, bytes) = envelope_bytes(
+        FULFILMENT_CREATED_EVENT_TYPE,
+        FULFILMENT_CREATED_SCHEMA_VERSION,
+        "fulfilment",
+        FULFILMENT_AGGREGATE_TYPE,
+        fulfilment_id,
+        1,
+        correlation_id,
+        Uuid::now_v7(),
+        FulfilmentCreatedPayload {
+            order_id,
+            fulfilment_id,
+        },
+    );
+    common::publish_raw(
+        &producer,
+        FULFILMENT_EVENTS_TOPIC,
+        &order_id.to_string(),
+        bytes.clone(),
+    )
+    .await;
+    common::publish_raw(
+        &producer,
+        FULFILMENT_EVENTS_TOPIC,
+        &order_id.to_string(),
+        bytes,
+    )
+    .await;
+    common::drain_outcomes(
+        &pool,
+        &consumer,
+        &producer,
+        &faults,
+        FULFILMENT_EVENTS_TOPIC,
+    )
+    .await;
+    assert_eq!(order_status(&pool, order_id).await, OrderStatus::Completed);
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from order_transitions where order_id = $1 and to_status = 'COMPLETED'",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn fulfilment_failure_waits_for_both_compensations(pool: PgPool) {
+    let _guard = common::topic_lock().await;
+    let producer = common::connect_producer().await;
+    let consumer = common::connect_consumer().await;
+    let faults = FaultInjector::new();
+    for topic in [
+        FULFILMENT_EVENTS_TOPIC,
+        INVENTORY_EVENTS_TOPIC,
+        PAYMENTS_EVENTS_TOPIC,
+    ] {
+        common::seed_outcome_offset_to_latest(&pool, &consumer, topic).await;
+    }
+    let (order_id, correlation_id, reservation_id, payment_id) = insert_ready_order(&pool).await;
+    let fulfilment_id = Uuid::now_v7();
+    let (_, bytes) = envelope_bytes(
+        FULFILMENT_FAILED_EVENT_TYPE,
+        FULFILMENT_FAILED_SCHEMA_VERSION,
+        "fulfilment",
+        FULFILMENT_AGGREGATE_TYPE,
+        fulfilment_id,
+        1,
+        correlation_id,
+        Uuid::now_v7(),
+        FulfilmentFailedPayload {
+            order_id,
+            fulfilment_id,
+            reason_code: "NO_CARRIER".into(),
+        },
+    );
+    common::publish_raw(
+        &producer,
+        FULFILMENT_EVENTS_TOPIC,
+        &order_id.to_string(),
+        bytes,
+    )
+    .await;
+    common::drain_outcomes(
+        &pool,
+        &consumer,
+        &producer,
+        &faults,
+        FULFILMENT_EVENTS_TOPIC,
+    )
+    .await;
+    assert_eq!(order_status(&pool, order_id).await, OrderStatus::Cancelling);
+    let commands: i64 = sqlx::query_scalar(
+        "select count(*) from outbox_events where aggregate_id = $1 and topic in ($2, $3)",
+    )
+    .bind(order_id)
+    .bind(INVENTORY_COMMANDS_TOPIC)
+    .bind(PAYMENTS_COMMANDS_TOPIC)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(commands, 2);
+    let (_, released) = envelope_bytes(
+        INVENTORY_RELEASED_EVENT_TYPE,
+        INVENTORY_RELEASED_SCHEMA_VERSION,
+        "inventory",
+        RESERVATION_AGGREGATE_TYPE,
+        reservation_id,
+        1,
+        correlation_id,
+        Uuid::now_v7(),
+        InventoryReleasedPayload {
+            order_id,
+            reservation_id,
+        },
+    );
+    common::publish_raw(
+        &producer,
+        INVENTORY_EVENTS_TOPIC,
+        &order_id.to_string(),
+        released,
+    )
+    .await;
+    common::drain_outcomes(&pool, &consumer, &producer, &faults, INVENTORY_EVENTS_TOPIC).await;
+    assert_eq!(order_status(&pool, order_id).await, OrderStatus::Cancelling);
+    let (_, refunded) = envelope_bytes(
+        PAYMENT_REFUNDED_EVENT_TYPE,
+        PAYMENT_REFUNDED_SCHEMA_VERSION,
+        "payments",
+        PAYMENT_AGGREGATE_TYPE,
+        payment_id,
+        1,
+        correlation_id,
+        Uuid::now_v7(),
+        PaymentRefundedPayload {
+            order_id,
+            payment_id,
+        },
+    );
+    common::publish_raw(
+        &producer,
+        PAYMENTS_EVENTS_TOPIC,
+        &order_id.to_string(),
+        refunded,
+    )
+    .await;
+    common::drain_outcomes(&pool, &consumer, &producer, &faults, PAYMENTS_EVENTS_TOPIC).await;
+    assert_eq!(order_status(&pool, order_id).await, OrderStatus::Cancelled);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn exhausted_compensation_enters_manual_review_and_signals_dlq(pool: PgPool) {
+    let _guard = common::topic_lock().await;
+    let producer = common::connect_producer().await;
+    let consumer = common::connect_consumer().await;
+    let faults = FaultInjector::new();
+    common::seed_outcome_offset_to_latest(&pool, &consumer, PAYMENTS_EVENTS_TOPIC).await;
+    let (order_id, correlation_id, _, payment_id) = insert_ready_order(&pool).await;
+    sqlx::query("update orders set status = 'CANCELLING', version = 5 where id = $1")
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, failed) = envelope_bytes(
+        REFUND_FAILED_EVENT_TYPE,
+        REFUND_FAILED_SCHEMA_VERSION,
+        "payments",
+        PAYMENT_AGGREGATE_TYPE,
+        payment_id,
+        1,
+        correlation_id,
+        Uuid::now_v7(),
+        RefundFailedPayload {
+            order_id,
+            payment_id,
+            reason_code: "REFUND_RETRY_BUDGET_EXHAUSTED".into(),
+        },
+    );
+    common::publish_raw(
+        &producer,
+        PAYMENTS_EVENTS_TOPIC,
+        &order_id.to_string(),
+        failed,
+    )
+    .await;
+    common::drain_outcomes(&pool, &consumer, &producer, &faults, PAYMENTS_EVENTS_TOPIC).await;
+    assert_eq!(
+        order_status(&pool, order_id).await,
+        OrderStatus::ManualReview
+    );
+    let dlq = format!("{}.dlq", PAYMENTS_EVENTS_TOPIC);
+    assert!(consumer.latest_offset(&dlq).await.unwrap() > 0);
+}
+
 /// Happy path (spec section 12): `reservation_succeeded` moves the order to
 /// `INVENTORY_RESERVED` and emits `authorize_payment`; `payment_authorized`
 /// then moves it to `PAYMENT_AUTHORIZED` -- entirely through
 /// events/commands, no synchronous cross-service HTTP call anywhere in
 /// this path (M06's own acceptance wording).
 #[sqlx::test(migrations = "./migrations")]
-async fn happy_path_reaches_payment_authorized(pool: PgPool) {
+async fn happy_path_reaches_fulfilment_readiness(pool: PgPool) {
     let _guard = common::topic_lock().await;
     let producer = common::connect_producer().await;
     let consumer = common::connect_consumer().await;
@@ -234,7 +469,7 @@ async fn happy_path_reaches_payment_authorized(pool: PgPool) {
 
     assert_eq!(
         order_status(&pool, order_id).await,
-        OrderStatus::PaymentAuthorized
+        OrderStatus::ReadyForFulfilment
     );
 }
 
