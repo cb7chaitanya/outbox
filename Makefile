@@ -71,7 +71,13 @@ test-unit:
 ## only needs to name a server the migrating user can create databases on.
 test-integration:
 	@test -f .env || (echo ".env not found; run 'make setup' first" && exit 1)
-	@set -a && . ./.env && set +a && \
+	@running_services="$$(docker compose ps --status running --services | grep -E '^(orders|inventory|payments|fulfilment)$$' | tr '\n' ' ')"; \
+	if [ -n "$$running_services" ]; then \
+		echo "stopping live consumers for deterministic integration tests: $$running_services"; \
+		docker compose stop $$running_services; \
+		trap 'docker compose start $$running_services' EXIT; \
+	fi; \
+	set -a && . ./.env && set +a && \
 	DATABASE_URL="postgres://$$POSTGRES_USER:$$POSTGRES_PASSWORD@$$POSTGRES_HOST:$$POSTGRES_PORT/$$POSTGRES_ORDERS_DB" \
 	cargo test --workspace --tests
 
