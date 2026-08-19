@@ -10,14 +10,14 @@
 - [x] M05 — Payments with retry taxonomy
 - [x] M06 — Choreographed workflow and compensation
 - [x] M07 — Fulfilment and complete compensation matrix
-- [ ] M08 — Ordering, replay, and concurrency hardening
+- [x] M08 — Ordering, replay, and concurrency hardening
 - [ ] M09 — Observability, chaos, and operations
 - [ ] M10 — Final acceptance, README, and learning write-up
 - [ ] M11 — Optional saga orchestrator (only after M10)
 
 ## Current milestone
 
-M07 complete. Next action: M08 — ordering, replay, and concurrency hardening.
+M08 complete. Next action: M09 — observability, chaos, and operations.
 
 ## Decisions
 
@@ -356,4 +356,5 @@ Acceptance evidence, including two real four-service flows, is recorded in
 
 ## Next action
 
-Start M08: ordering, replay, and concurrency hardening.
+Start M09: observability, chaos, and operations. M08 evidence is recorded in
+`docs/evidence/m08.md`.
