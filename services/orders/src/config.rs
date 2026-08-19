@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeliveryMode {
-    /// Direct DB-commit-then-Kafka-publish (spec section 11). The only
-    /// real mode until M03 adds the transactional outbox.
+    /// Direct DB-commit-then-Kafka-publish (spec section 11). Kept
+    /// runnable behind this opt-in mode so the M02 failure lab remains
+    /// reproducible; no longer the default now that the outbox exists.
     Naive,
-    /// Not implemented until M03; accepted here so `.env` can name it
-    /// without the config loader rejecting an otherwise-valid file.
+    /// Atomic DB-commit-plus-outbox-row, published by a separate worker
+    /// (spec section 13). The default since M03.
     Outbox,
 }
 
@@ -20,6 +21,11 @@ pub struct Config {
     pub bind_addr: String,
     pub port: u16,
     pub delivery_mode: DeliveryMode,
+    pub outbox_batch_size: i64,
+    pub outbox_lease_seconds: i64,
+    pub outbox_poll_interval_ms: u64,
+    pub outbox_backoff_base_ms: u64,
+    pub outbox_backoff_cap_ms: u64,
 }
 
 impl Default for Config {
@@ -27,7 +33,12 @@ impl Default for Config {
         Self {
             bind_addr: "0.0.0.0".to_string(),
             port: 8081,
-            delivery_mode: DeliveryMode::Naive,
+            delivery_mode: DeliveryMode::Outbox,
+            outbox_batch_size: 20,
+            outbox_lease_seconds: 30,
+            outbox_poll_interval_ms: 200,
+            outbox_backoff_base_ms: 100,
+            outbox_backoff_cap_ms: 30_000,
         }
     }
 }
@@ -45,6 +56,17 @@ impl Config {
 
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.bind_addr, self.port)
+    }
+
+    pub fn publisher_config(&self, claimed_by: String) -> persistence::outbox::PublisherConfig {
+        persistence::outbox::PublisherConfig {
+            claimed_by,
+            batch_size: self.outbox_batch_size,
+            lease: chrono::Duration::seconds(self.outbox_lease_seconds),
+            poll_interval: std::time::Duration::from_millis(self.outbox_poll_interval_ms),
+            backoff_base: std::time::Duration::from_millis(self.outbox_backoff_base_ms),
+            backoff_cap: std::time::Duration::from_millis(self.outbox_backoff_cap_ms),
+        }
     }
 }
 
@@ -146,7 +168,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn delivery_mode_defaults_to_naive() {
+    fn delivery_mode_defaults_to_outbox() {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: guarded by ENV_LOCK; no other thread reads/writes these
         // vars concurrently within this test binary.
@@ -154,17 +176,17 @@ mod tests {
             std::env::remove_var("DELIVERY_MODE");
         }
         let config = Config::load().expect("config loads with no env override");
-        assert_eq!(config.delivery_mode, DeliveryMode::Naive);
+        assert_eq!(config.delivery_mode, DeliveryMode::Outbox);
     }
 
     #[test]
     fn delivery_mode_reads_unprefixed_env_var() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
-            std::env::set_var("DELIVERY_MODE", "outbox");
+            std::env::set_var("DELIVERY_MODE", "naive");
         }
-        let config = Config::load().expect("config loads with DELIVERY_MODE=outbox");
-        assert_eq!(config.delivery_mode, DeliveryMode::Outbox);
+        let config = Config::load().expect("config loads with DELIVERY_MODE=naive");
+        assert_eq!(config.delivery_mode, DeliveryMode::Naive);
         unsafe {
             std::env::remove_var("DELIVERY_MODE");
         }
