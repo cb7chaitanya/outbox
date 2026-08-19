@@ -644,6 +644,31 @@ async fn handle_one(
         Err(TransitionError::IllegalTransition { from, to }) => {
             log_illegal_transition_race(envelope.aggregate_id, from, to);
         }
+        Err(TransitionError::NotFound) => {
+            // A poison/integrity case (spec section 15), not an
+            // infrastructure failure: without this, one record naming an
+            // order this consumer's database has no row for would
+            // propagate as `Err` out of `process_available` and wedge the
+            // offset ledger on that exact record forever (invariant I15 --
+            // "a permanently invalid event cannot block its partition
+            // forever"), since nothing downstream of a real `Err` here
+            // advances past it.
+            tx.rollback().await?;
+            publish_dlq(
+                producer,
+                source_topic,
+                &key,
+                record,
+                Some(serde_json::to_value(&envelope).unwrap_or_default()),
+                "UNKNOWN_ORDER",
+                format!(
+                    "{} (aggregate {}) referenced an order this consumer has no row for",
+                    envelope.event_type, envelope.aggregate_id
+                ),
+            )
+            .await?;
+            return Ok(HandleOutcome::Poison);
+        }
         Err(e) => return Err(e.into()),
     }
 

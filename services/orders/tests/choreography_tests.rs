@@ -567,6 +567,105 @@ async fn duplicated_and_reordered_outcomes_do_not_create_illegal_transitions(poo
     );
 }
 
+/// An outcome record naming an order this consumer's database has no row
+/// for (e.g. a genuinely unknown order, or -- as this exact scenario was
+/// first caught live -- cross-talk on a shared dev broker) must reach the
+/// DLQ and let the partition keep moving, not propagate as an
+/// infrastructure error that wedges the offset ledger on that record
+/// forever (invariant I15). Regression test for a real bug this milestone's
+/// own live end-to-end check surfaced (see `docs/evidence/m06.md`).
+#[sqlx::test(migrations = "./migrations")]
+async fn unknown_order_reference_does_not_block_the_partition(pool: PgPool) {
+    let _guard = common::topic_lock().await;
+    let producer = common::connect_producer().await;
+    let consumer = common::connect_consumer().await;
+    let fault_injector = FaultInjector::new();
+    common::seed_outcome_offset_to_latest(&pool, &consumer, INVENTORY_EVENTS_TOPIC).await;
+
+    let unknown_order_id = Uuid::now_v7();
+    let unknown_reservation_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+    let (_id, poison_bytes) = envelope_bytes(
+        RESERVATION_SUCCEEDED_EVENT_TYPE,
+        RESERVATION_SUCCEEDED_SCHEMA_VERSION,
+        "inventory",
+        RESERVATION_AGGREGATE_TYPE,
+        unknown_reservation_id,
+        1,
+        correlation_id,
+        Uuid::now_v7(),
+        ReservationSucceededPayload {
+            order_id: unknown_order_id,
+            reservation_id: unknown_reservation_id,
+            items: vec![ReserveInventoryItem {
+                sku: "SKU-CHOREO-1".to_string(),
+                quantity: 1,
+            }],
+        },
+    );
+    common::publish_raw(
+        &producer,
+        INVENTORY_EVENTS_TOPIC,
+        &unknown_order_id.to_string(),
+        poison_bytes,
+    )
+    .await;
+
+    // A real, valid order right behind the poison record on the same
+    // topic -- it must still be processed.
+    let (order_id, real_correlation_id, reserve_event_id) =
+        create_order_and_drain(&pool, &producer).await;
+    let reservation_id = Uuid::now_v7();
+    let (_id, valid_bytes) = envelope_bytes(
+        RESERVATION_SUCCEEDED_EVENT_TYPE,
+        RESERVATION_SUCCEEDED_SCHEMA_VERSION,
+        "inventory",
+        RESERVATION_AGGREGATE_TYPE,
+        reservation_id,
+        1,
+        real_correlation_id,
+        reserve_event_id,
+        ReservationSucceededPayload {
+            order_id,
+            reservation_id,
+            items: vec![ReserveInventoryItem {
+                sku: "SKU-CHOREO-1".to_string(),
+                quantity: 2,
+            }],
+        },
+    );
+    common::publish_raw(
+        &producer,
+        INVENTORY_EVENTS_TOPIC,
+        &order_id.to_string(),
+        valid_bytes,
+    )
+    .await;
+
+    let summary = common::drain_outcomes(
+        &pool,
+        &consumer,
+        &producer,
+        &fault_injector,
+        INVENTORY_EVENTS_TOPIC,
+    )
+    .await;
+    assert!(
+        !summary.stopped_by_fault,
+        "the unknown-order record must not stop the batch"
+    );
+    assert_eq!(summary.poison, 1, "the unknown-order record is DLQ'd");
+    assert_eq!(
+        summary.applied, 1,
+        "the real order right behind it still applies"
+    );
+    assert_eq!(
+        order_status(&pool, order_id).await,
+        OrderStatus::InventoryReserved,
+        "the valid record must not be blocked by the poison one ahead of it"
+    );
+}
+
 /// Every event/command in one order's journey shares its correlation_id,
 /// and each one's causation_id points at the record that triggered it
 /// (spec section 16).
