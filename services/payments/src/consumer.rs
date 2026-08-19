@@ -242,6 +242,7 @@ async fn handle_authorize(
 async fn handle_refund(
     tx: &mut Transaction<'_, Postgres>,
     provider: &dyn PaymentProvider,
+    retry_config: &RetryConfig,
     envelope: &Envelope<serde_json::Value>,
     payload: &RefundPaymentPayload,
     now: DateTime<Utc>,
@@ -261,10 +262,29 @@ async fn handle_refund(
 
     let idempotency_key = domain::refund_idempotency_key(payload.order_id);
     let provider_reference = payment.provider_reference.clone().unwrap_or_default();
-    provider
-        .refund(&idempotency_key, payload.order_id, &provider_reference)
-        .await
-        .map_err(|e| anyhow::anyhow!("refund provider call failed: {e}"))?;
+    let started = Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match provider
+            .refund(&idempotency_key, payload.order_id, &provider_reference)
+            .await
+        {
+            Ok(()) => break,
+            Err(_)
+                if attempts < retry_config.max_attempts
+                    && started.elapsed() < retry_config.max_elapsed =>
+            {
+                let delay = persistence::outbox::full_jitter_backoff(
+                    attempts - 1,
+                    retry_config.backoff_base,
+                    retry_config.backoff_cap,
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(_) => return Ok(vec![build_refund_failed_event(envelope, payload)]),
+        }
+    }
 
     repository::record_refunded(tx, &payment, now).await?;
     repository::record_operation(
@@ -381,6 +401,43 @@ fn build_refunded_event(
         topic: PAYMENTS_EVENTS_TOPIC.to_string(),
         message_key: payload.order_id.to_string(),
         envelope: serde_json::to_value(&inner).expect("envelope serializes"),
+    }
+}
+
+fn build_refund_failed_event(
+    envelope: &Envelope<serde_json::Value>,
+    payload: &RefundPaymentPayload,
+) -> NewOutboxEvent {
+    use contracts::payments::{
+        REFUND_FAILED_EVENT_TYPE, REFUND_FAILED_SCHEMA_VERSION, RefundFailedPayload,
+    };
+    let event_id = Uuid::now_v7();
+    let inner = Envelope {
+        event_id,
+        event_type: REFUND_FAILED_EVENT_TYPE.to_string(),
+        schema_version: REFUND_FAILED_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        producer: PAYMENTS_PRODUCER_NAME.to_string(),
+        aggregate_type: PAYMENT_AGGREGATE_TYPE.to_string(),
+        aggregate_id: payload.payment_id,
+        aggregate_version: 2,
+        correlation_id: envelope.correlation_id,
+        causation_id: envelope.event_id,
+        traceparent: None,
+        payload: RefundFailedPayload {
+            order_id: payload.order_id,
+            payment_id: payload.payment_id,
+            reason_code: "REFUND_RETRY_BUDGET_EXHAUSTED".to_string(),
+        },
+    };
+    NewOutboxEvent {
+        id: event_id,
+        aggregate_type: PAYMENT_AGGREGATE_TYPE.to_string(),
+        aggregate_id: payload.payment_id,
+        aggregate_version: 2,
+        topic: PAYMENTS_EVENTS_TOPIC.to_string(),
+        message_key: payload.order_id.to_string(),
+        envelope: serde_json::to_value(inner).expect("serializes"),
     }
 }
 
@@ -605,7 +662,7 @@ async fn handle_one(
                 return Ok(HandleOutcome::Poison);
             }
         };
-        handle_refund(&mut tx, provider, &envelope, &payload, now).await?
+        handle_refund(&mut tx, provider, retry_config, &envelope, &payload, now).await?
     };
 
     for event in &outbox_events {

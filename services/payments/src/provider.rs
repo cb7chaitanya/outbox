@@ -34,6 +34,7 @@ use uuid::Uuid;
 pub const FAULT_PROVIDER_TIMEOUT: &str = "payments.provider.timeout";
 pub const FAULT_PROVIDER_DECLINE: &str = "payments.provider.decline";
 pub const FAULT_PROVIDER_RESPONSE_LOST: &str = "payments.provider.success_response_lost";
+pub const FAULT_PROVIDER_REFUND_TIMEOUT: &str = "payments.provider.refund_timeout";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderOutcome {
@@ -192,6 +193,16 @@ impl PaymentProvider for FakeProvider {
             .contains_key(idempotency_key)
         {
             return Ok(());
+        }
+        if self
+            .fault_injector
+            .maybe_fail(FAULT_PROVIDER_REFUND_TIMEOUT, Some(idempotency_key))
+            .await
+            .is_err()
+        {
+            return Err(ProviderError::Unavailable(
+                "simulated refund timeout".to_string(),
+            ));
         }
         self.refund_ledger
             .lock()
