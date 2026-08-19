@@ -96,12 +96,28 @@ async fn publish_dlq(
     persistence::dlq::publish(producer, source_topic, key, &dlq_record).await
 }
 
+/// `aggregate_version` here is deliberately **not** the order's own
+/// version (which is 2 by the time this command is built, since the
+/// reservation-success transition already happened) — it's this
+/// command's position in the orders→payments command stream specifically,
+/// which the payments consumer tracks independently via its own
+/// `(consumer_name, aggregate_id)` row (spec section 14). Using the
+/// order's global version here would make payments see a gap on its very
+/// first message for this order (last_version 0, incoming 2), since
+/// payments never receives a message at order-version 1 — that one went
+/// to inventory instead. `1` is correct because this is, in this
+/// milestone's scope, the only command orders ever sends to payments for
+/// a given order; M06 (refunds are the second such command) must turn
+/// this into a real per-order, per-downstream-consumer counter rather
+/// than a constant. See
+/// `docs/adr/0010-orders-consumes-reservation-outcomes.md`.
+const FIRST_PAYMENTS_COMMAND_VERSION: i64 = 1;
+
 fn build_authorize_payment_event(
     envelope: &Envelope<serde_json::Value>,
     order_id: Uuid,
     currency: &str,
     amount_minor: i64,
-    order_version: i64,
 ) -> NewOutboxEvent {
     let payment_id = Uuid::now_v7();
     let event_id = Uuid::now_v7();
@@ -113,7 +129,7 @@ fn build_authorize_payment_event(
         producer: "orders".to_string(),
         aggregate_type: PAYMENT_COMMAND_AGGREGATE_TYPE.to_string(),
         aggregate_id: order_id,
-        aggregate_version: order_version,
+        aggregate_version: FIRST_PAYMENTS_COMMAND_VERSION,
         correlation_id: envelope.correlation_id,
         causation_id: envelope.event_id,
         traceparent: None,
@@ -130,7 +146,7 @@ fn build_authorize_payment_event(
         id: event_id,
         aggregate_type: PAYMENT_COMMAND_AGGREGATE_TYPE.to_string(),
         aggregate_id: order_id,
-        aggregate_version: order_version,
+        aggregate_version: FIRST_PAYMENTS_COMMAND_VERSION,
         topic: PAYMENTS_COMMANDS_TOPIC.to_string(),
         message_key: order_id.to_string(),
         envelope: serde_json::to_value(&inner).expect("envelope serializes"),
@@ -348,13 +364,12 @@ async fn handle_one(
             Some("inventory reservation succeeded"),
             Some(envelope.event_id),
             now,
-            move |order_id, order_version| {
+            move |order_id, _order_version| {
                 vec![build_authorize_payment_event(
                     &envelope_for_event,
                     order_id,
                     &currency,
                     amount_minor,
-                    order_version,
                 )]
             },
         )
