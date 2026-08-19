@@ -344,3 +344,44 @@ pub fn spawn_publisher_loop(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_jitter_backoff_never_exceeds_cap() {
+        let base = StdDuration::from_millis(100);
+        let cap = StdDuration::from_secs(30);
+        for attempts in 0..40 {
+            let delay = full_jitter_backoff(attempts, base, cap);
+            assert!(delay <= cap, "attempts={attempts} produced {delay:?} > cap {cap:?}");
+        }
+    }
+
+    #[test]
+    fn full_jitter_backoff_grows_with_attempts_on_average() {
+        // Not a tight bound (it's randomized), just a sanity check that the
+        // upper bound used for sampling actually increases before it hits
+        // the cap, so this isn't secretly a fixed sleep.
+        let base = StdDuration::from_millis(100);
+        let cap = StdDuration::from_secs(30);
+        let sample = |attempts: u32| -> StdDuration {
+            (0..200)
+                .map(|_| full_jitter_backoff(attempts, base, cap))
+                .max()
+                .unwrap()
+        };
+        assert!(sample(0) <= sample(1));
+        assert!(sample(1) <= sample(2));
+    }
+
+    #[test]
+    fn full_jitter_backoff_zero_attempts_bounded_by_base() {
+        let base = StdDuration::from_millis(100);
+        let cap = StdDuration::from_secs(30);
+        for _ in 0..200 {
+            assert!(full_jitter_backoff(0, base, cap) <= base);
+        }
+    }
+}
